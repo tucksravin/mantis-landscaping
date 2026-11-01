@@ -495,6 +495,36 @@ describe("theme-colors", () => {
       ],
       // A Tailwind ring whose width is 20rem is an inset shadow; the throw names it.
       ["border-white text-white hover:ring-inset hover:ring-[20rem] hover:ring-white", /inset/],
+      // Review round 7. A length in a unit this file cannot size throws, rather than reading as
+      // zero (vmax, dvh), and a negative offset written as a sum or a min() is read or refused.
+      ["border-white text-white hover:shadow-[inset_0_0_0_20vmax_white]", /vmax/],
+      ["border-white text-white hover:inset-ring-[20dvh] hover:inset-ring-white", /dvh/],
+      [
+        "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:shadow-[inset_0_0_0_20vmax_white]",
+        /::before/,
+      ],
+      [
+        "border-white text-white hover:outline-[20rem] hover:outline-white hover:outline-offset-[-20vmax]",
+        /vmax/,
+      ],
+      [
+        "border-white text-white hover:outline-[20rem] hover:outline-white hover:outline-offset-[calc(0px-20rem)]",
+        /outline/,
+      ],
+      [
+        "border-white text-white hover:outline-[20rem] hover:outline-white hover:outline-offset-[min(-20rem,0px)]",
+        /cannot read the length "min/,
+      ],
+      // A ::after whose border-image paints, with a transparent border colour.
+      [
+        "relative isolate overflow-hidden border-white text-white after:absolute after:inset-0 after:-z-10 hover:after:border-[20rem] hover:after:border-transparent hover:after:[border-image:linear-gradient(white,white)_1]",
+        /::after/,
+      ],
+      // A ::before whose backdrop filter inverts what lies behind the button.
+      [
+        "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:backdrop-invert",
+        /backdrop-filter/,
+      ],
     ];
     for (const [cls, why] of known) {
       const p = el(`<div class="bg-dark"><a data-probe class="${cls}">x</a></div>`);
@@ -513,6 +543,34 @@ describe("theme-colors", () => {
       '<div class="bg-dark"><a data-probe class="relative text-white before:bg-transparent hover:before:bg-transparent">x</a></div>',
     );
     expect(groundOf(clear, { state: { hover: true } })).toEqual(themeColour("dark"));
+  });
+
+  it("reads an inward ring or outline that stops short of the content, refuses one that reaches it, and skips a decoration away from the text", () => {
+    // A 2px inward focus ring on a padded link stays inside the padding, so it is measured as
+    // no threat (the review round 7 known-good): 2px + 2px reach, 16px of padding.
+    const ring = el(
+      '<div class="bg-dark"><a data-probe class="px-10 py-4 text-white focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-white">x</a></div>',
+    );
+    expect(groundOf(ring, { state: { focusVisible: true } })).toEqual(themeColour("dark"));
+    // A decorative underline below the button, drawn by a border, is not under the label.
+    const underline = el(
+      '<div class="bg-dark"><a data-probe class="relative border-white text-white hover:bg-white hover:text-dark after:absolute after:inset-x-0 after:-bottom-2 after:border-b-2 after:border-white">x</a></div>',
+    );
+    // The link's own hover fill is the ground here (white); the underline is not part of it.
+    expect(groundOf(underline, { state: { hover: true } })).toEqual(themeColour("white"));
+    // A list bullet sits in the item's padding, not over its text.
+    const bullet = el(
+      '<div class="bg-dark"><li data-probe class="relative pl-4 text-white before:absolute before:left-0 before:top-2 before:size-2 before:rounded-full before:border before:border-gold">x</li></div>',
+    );
+    expect(groundOf(bullet)).toEqual(themeColour("dark"));
+    // A ::before that generates no box (content none, or no content rule at all) paints nothing.
+    for (const cls of [
+      "relative text-white before:content-none before:bg-white",
+      "relative text-white [&::before]:bg-white",
+    ]) {
+      const p = el(`<div class="bg-dark"><a data-probe class="${cls}">x</a></div>`);
+      expect(groundOf(p), cls).toEqual(themeColour("dark"));
+    }
   });
 
   it("reads a fill that paints nothing as unpainted, whatever spelling gives it", () => {

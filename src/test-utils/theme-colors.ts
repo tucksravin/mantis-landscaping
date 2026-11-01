@@ -92,7 +92,13 @@ import { compile } from "tailwindcss";
  * not load them), and the text of another box: `::before`, `::after`,
  * `::marker`, `::placeholder`, `::file-selector-button` and `::backdrop` are
  * skipped, so their colours are not checked. A `::before` or `::after` that
- * paints a box is refused by `groundOf` (above). A positioned child that
+ * paints a box under the text is refused by `groundOf` (above): one in the
+ * flow, or positioned to cover the element on both axes. A positioned one
+ * that covers only part of an axis (an underline below the element, a bullet
+ * in its padding, a half-width fill) is not read, so a half-width fill under
+ * the label is a known false green. A length this file cannot size (`%`,
+ * `em`, viewport units, `min()`, `max()`, `clamp()`) throws where a fill
+ * or an inward outline depends on it. A positioned child that
  * paints a fill (`<span class="absolute inset-0 -z-10 bg-white">`) is not
  * read: `groundOf` walks ancestors only. Out-of-gamut oklch is clipped to sRGB.
  */
@@ -554,7 +560,12 @@ function parsesSelector(x: string): boolean {
  *  Its host is matched as any rule's is. A host this file cannot evaluate throws
  *  in `winner` when it could match, as an unmodelled rule does. */
 function keepFill(sel: string, pe: RegExpExecArray, n: Node, layer: number, ctx: Ctx) {
-  if (!n.decls.some((d) => BOX_PAINT.test(d.prop))) return;
+  if (
+    !n.decls.some(
+      (d) => BOX_PAINT.test(d.prop) || d.prop === "content" || !PSEUDO_SAFE.test(d.prop),
+    )
+  )
+    return;
   let host = sel.slice(0, pe.index).replace(/\s+$/, " ");
   if (!host.trim() || /[\s>+~]$/.test(host)) host += "*";
   const exact = rewritePseudo(host, false);
@@ -678,10 +689,37 @@ let boxSink: Rule[] | undefined;
 const BOX_PAINT =
   /^(background(-|$)|box-shadow$|border(-|$)|outline(-|$)|mask(-|$)|-webkit-mask(-|$)|filter$|--tw-)/;
 
-function sheet(): Rule[] {
+/** The properties a `::before` or `::after` may set and still paint nothing: its content,
+ *  where it sits, its size, its transform and opacity, its transition. A pseudo rule that sets
+ *  any other property is kept and read, so the next paint property is refused too (round 7).
+ *  Custom properties are read through the cascade of the properties they feed. */
+const PSEUDO_SAFE =
+  /^(display$|position$|top$|right$|bottom$|left$|inset(-|$)|width$|height$|min-|max-|inline-size$|block-size$|box-sizing$|margin(-|$)|padding(-|$)|z-index$|transform(-|$)|translate$|rotate$|scale$|transform-origin$|opacity$|transition(-|$)|animation-(duration|delay|timing-function|iteration-count|direction|fill-mode|play-state)$|overflow(-|$)|scroll-|flex(-|$)|order$|grid(-|$)|gap$|row-gap$|column-gap$|align-|justify-|place-|float$|clear$|pointer-events$|visibility$|isolation$|aspect-ratio$|cursor$|user-select$|vertical-align$)/;
+
+/** Depth of the calls in progress that already read the document's classes. */
+let scanning = 0;
+
+/** Run `fn` with the document's classes read once, at the outermost call. `sheet()` walks
+ *  the whole document, and the cascade asks for it on every property it reads, so a call
+ *  that reads many properties would otherwise walk it hundreds of times. The classes cannot
+ *  change inside one call: `withState` only sets marker attributes. */
+function scan<T>(fn: () => T): T {
+  if (scanning++ === 0) collectClasses();
+  try {
+    return fn();
+  } finally {
+    scanning--;
+  }
+}
+
+function collectClasses() {
   for (const el of document.querySelectorAll("[class]")) {
     for (const c of el.classList) seen.add(c);
   }
+}
+
+function sheet(): Rule[] {
+  if (scanning === 0) collectClasses();
   if (cached && cached.size === seen.size) return cached.rules;
   const rules: Rule[] = [];
   const boxes: Rule[] = [];
@@ -897,6 +935,10 @@ function otherFlags(
  *  A state on another element marks every ancestor (`group`) or every
  *  preceding sibling (`peer`). */
 function withState<T>(el: Element, state: State, fn: () => T): T {
+  return scan(() => withStateIn(el, state, fn));
+}
+
+function withStateIn<T>(el: Element, state: State, fn: () => T): T {
   const hovering = state.hover || state.group?.hover || state.peer?.hover;
   if (state.canHover === false && hovering)
     throw new Error(
@@ -1544,21 +1586,94 @@ const BORDER_SIDES = [
 ];
 const LINE_STYLE = /^(none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset)$/i;
 const LINE_WIDTH = /^(thin|medium|thick)$/i;
-const LENGTH = /^[-+]?(\d+\.?\d*|\.\d+)(px|rem|em|%|ch|ex|vw|vh|cm|mm|in|pt|pc)?$/i;
+// A length by its shape, whatever its unit: `20vmax` is a length this file cannot size, not
+// a word it may skip. `pxOf` reads the ones it can and throws on the rest.
+const LENGTH = /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?([a-z]+|%)?$/i;
 
-/** A length word: a number with a unit, or a `calc()`. */
-const isLength = (w: string) => LENGTH.test(w) || /^calc\(/i.test(w);
-/** A zero length, or a `calc()` whose every number is zero. */
+/** A length word: a number with a unit, or a math function. */
+const isLength = (w: string) => LENGTH.test(w) || /^(calc|min|max|clamp)\(/i.test(w);
+/** A zero length, or a math function whose every number is zero. */
 const isZeroLength = (w: string) =>
   isLength(w) && [...w.matchAll(/\d*\.?\d+/g)].every(([n]) => Number(n) === 0);
 
-/** Whether a length is below zero: a leading minus, or a minus that a `calc()` multiplies
- *  by (Tailwind writes `-outline-offset-*` as `calc(20rem * -1)`). A sum is not read. */
-function isNegative(v: string): boolean {
-  const s = v.trim().toLowerCase();
-  if (!isLength(s) || isZeroLength(s)) return false;
-  const minuses = (s.replace(/^calc\(/, "(").match(/(^|[(*/])\s*-/g) ?? []).length;
-  return minuses % 2 === 1;
+/** A length in CSS pixels. `px`, `rem` (16px, the root size this file assumes), a bare zero,
+ *  and `calc()` of those with `+ - * /` and parentheses. Anything else throws, since a
+ *  `%`, `em`, viewport or container unit, `min()`, `max()` or `clamp()` needs layout, which
+ *  this file does not have: a reader that cannot place a length does not guess its size. */
+function pxOf(expr: string): number {
+  const text = expr.trim();
+  if (/^(initial|unset|revert|revert-layer)$/i.test(text)) return 0;
+  const src = text.replace(/^calc(?=\s*\()/i, "");
+  type Tok = { num: number; unit: string } | { op: string };
+  const toks: Tok[] = [];
+  const re = /\s*(?:(\d+\.?\d*|\.\d+)(e[-+]?\d+)?([a-z]+|%)?|([-+*/()]))/iy;
+  for (let pos = 0; pos < src.length;) {
+    re.lastIndex = pos;
+    const m = re.exec(src);
+    if (!m) throw new Error(`cannot read the length "${text}"`);
+    pos = re.lastIndex;
+    if (m[4]) toks.push({ op: m[4] });
+    else toks.push({ num: Number(m[1] + (m[2] ?? "")), unit: (m[3] ?? "").toLowerCase() });
+  }
+  type Val = { v: number; px: boolean };
+  let i = 0;
+  const bad = (): never => {
+    throw new Error(`cannot read the length "${text}"`);
+  };
+  // A bare zero is a length in every position a length can stand.
+  const len = (x: Val): Val => (!x.px && x.v === 0 ? { v: 0, px: true } : x);
+  const factor = (): Val => {
+    const t = toks[i];
+    if (!t) return bad();
+    if ("op" in t) {
+      if (t.op === "-" || t.op === "+") {
+        i++;
+        const f = factor();
+        return { v: t.op === "-" ? -f.v : f.v, px: f.px };
+      }
+      if (t.op !== "(") return bad();
+      i++;
+      const e = sum();
+      if (!toks[i] || !("op" in toks[i]) || (toks[i] as { op: string }).op !== ")") return bad();
+      i++;
+      return e;
+    }
+    i++;
+    if (t.unit === "px") return { v: t.num, px: true };
+    if (t.unit === "rem") return { v: t.num * 16, px: true };
+    if (t.unit === "") return { v: t.num, px: false };
+    return bad();
+  };
+  const product = (): Val => {
+    let a = factor();
+    for (let t = toks[i]; t && "op" in t && (t.op === "*" || t.op === "/"); t = toks[i]) {
+      i++;
+      const b = factor();
+      if (t.op === "*") {
+        if (a.px && b.px) return bad();
+        a = { v: a.v * b.v, px: a.px || b.px };
+      } else {
+        if (b.px || b.v === 0) return bad();
+        a = { v: a.v / b.v, px: a.px };
+      }
+    }
+    return a;
+  };
+  const sum = (): Val => {
+    let a = product();
+    for (let t = toks[i]; t && "op" in t && (t.op === "+" || t.op === "-"); t = toks[i]) {
+      i++;
+      const b0 = product();
+      const [x, b] = [len(a), len(b0)];
+      if (x.px !== b.px) return bad();
+      a = { v: t.op === "+" ? x.v + b.v : x.v - b.v, px: true };
+    }
+    return a;
+  };
+  const top = sum();
+  if (i !== toks.length) return bad();
+  if (!top.px) return top.v === 0 ? 0 : bad();
+  return top.v;
 }
 
 /** Run `fn`; a failure rethrows naming `what` and the element's class, so a reader of the
@@ -1652,6 +1767,7 @@ function edgePainted(
   sides: string[],
   state: State,
   box?: "before" | "after",
+  anyColour = false,
 ): { prop: string; value: string; from: string } | undefined {
   for (const side of sides) {
     const style = edgePart(n, family, side, "style", state, box);
@@ -1659,7 +1775,7 @@ function edgePainted(
     const width = edgePart(n, family, side, "width", state, box)?.value ?? "medium";
     if (isZeroLength(width)) continue;
     const colour = edgePart(n, family, side, "colour", state, box)?.value ?? "currentcolor";
-    if (colourIn(colour, n, state, `${family}${side} colour`).a > 0)
+    if (anyColour || colourIn(colour, n, state, `${family}${side} colour`).a > 0)
       return {
         prop: `${family}${side}`,
         value: `${width} ${style.value} ${colour}`,
@@ -1677,14 +1793,88 @@ function paintsImage(prop: string, value: string): boolean {
     : /\b(url|gradient|image|image-set|element)\(/.test(value);
 }
 
+type Side = "top" | "right" | "bottom" | "left";
+const SIDE_INDEX: Record<Side, number> = { top: 0, right: 1, bottom: 2, left: 3 };
+
+/** The value of one side from a 1-to-4-value shorthand (`padding`, `inset`). */
+function pickSide(words: string[], side: Side): string {
+  const i = SIDE_INDEX[side];
+  if (words.length === 1) return words[0];
+  if (words.length === 2) return words[i % 2];
+  if (words.length === 3) return words[i === 3 ? 1 : i];
+  return words[i];
+}
+
+/** The value of one axis side from a 1-or-2-value axis shorthand (`padding-block`, `inset-inline`). */
+function pickAxis(words: string[], side: Side): string {
+  return side === "top" || side === "left" ? words[0] : (words[1] ?? words[0]);
+}
+
+const LOGICAL_INSET = [
+  "inset-block-start",
+  "inset-block-end",
+  "inset-inline-start",
+  "inset-inline-end",
+];
+
+/** The offset of `side` of a box's `box` pseudo-element, in px; undefined when it is `auto` or
+ *  not set. Throws on a logical inset or a value this file cannot size. Call inside `withState`. */
+function insetPx(
+  n: Element,
+  box: "before" | "after",
+  side: Side,
+  state: State,
+): number | undefined {
+  if (winnerOf(n, LOGICAL_INSET, state, box))
+    throw new Error(
+      `a logical inset on ::${box} of <${n.tagName.toLowerCase()} class="${n.getAttribute("class") ?? ""}"> cannot be read`,
+    );
+  const axis = side === "top" || side === "bottom" ? "inset-block" : "inset-inline";
+  const w = winnerOf(n, [side, axis, "inset"], state, box);
+  if (!w) return undefined;
+  const value = expandVars(w.value, n, state, 0, box).trim();
+  if (/^auto$/i.test(value)) return undefined;
+  const words = topWords(value);
+  const pick =
+    w.prop === "inset" ? pickSide(words, side) : w.prop === axis ? pickAxis(words, side) : words[0];
+  return naming(n, `::${box} ${side} inset`, () => pxOf(pick));
+}
+
+/** Whether a `::before` or `::after` can lie under the text of `n`: a box in the flow, or one
+ *  positioned out of it that covers the element on both axes (top and bottom at or past the
+ *  edges, or `height: 100%`, and the same for left and right). A positioned box that covers
+ *  only part of an axis (an underline below the element, a bullet in its padding) is not
+ *  read. Call inside `withState`. */
+function mayLieUnderText(n: Element, box: "before" | "after", state: State): boolean {
+  const pos = winnerOf(n, ["position"], state, box)?.value.trim().toLowerCase();
+  if (pos !== "absolute" && pos !== "fixed") return true;
+  const covers = (a: Side, b: Side, size: string) => {
+    if (winnerOf(n, [size], state, box)?.value.trim() === "100%") return true;
+    const [x, y] = [insetPx(n, box, a, state), insetPx(n, box, b, state)];
+    return x !== undefined && y !== undefined && x <= 0 && y <= 0;
+  };
+  return covers("top", "bottom", "height") && covers("left", "right", "width");
+}
+
+/** The paint of `prop`-`box`'s `content`: a box exists unless the winning content is none or
+ *  normal, or no rule sets content (a `[&::before]` with no `content` generates no box). */
+function generatesBox(n: Element, box: "before" | "after", state: State): boolean {
+  const content = winnerOf(n, ["content"], state, box);
+  if (!content) return false;
+  return !/^(none|normal)$/i.test(expandVars(content.value, n, state, 0, box).trim());
+}
+
 /** The first property of `n`'s `box` that paints a box in `state`: a background (an image,
  *  or a colour with alpha), a box-shadow layer that paints, a border or outline side that
- *  paints, a mask that is not none, or a filter that is not neutral. Undefined when none does. */
+ *  paints, a border image, a mask that is not none, or a filter or other effect that is not
+ *  neutral, or any other property outside `PSEUDO_SAFE`. Undefined when none does, or when the
+ *  pseudo generates no box or cannot lie under the text. */
 function pseudoPaints(
   n: Element,
   box: "before" | "after",
   state: State,
 ): { prop: string; value: string; from: string } | undefined {
+  if (!generatesBox(n, box, state) || !mayLieUnderText(n, box, state)) return undefined;
   const image = winnerOf(n, ["background-image", "background"], state, box);
   if (image) {
     const value = expandVars(image.value, n, state, 0, box).trim();
@@ -1702,6 +1892,14 @@ function pseudoPaints(
         return { prop: "box-shadow", value: shadow.value.trim(), from: shadow.from };
   const border = edgePainted(n, "border", BORDER_SIDES, state, box);
   if (border) return border;
+  // A border image replaces the border's colour wherever the border has a style and a width.
+  const image2 = winnerOf(n, ["border-image", "border-image-source"], state, box);
+  if (
+    image2 &&
+    !/^(none|initial|unset|revert)$/i.test(expandVars(image2.value, n, state, 0, box).trim()) &&
+    edgePainted(n, "border", BORDER_SIDES, state, box, true)
+  )
+    return { prop: image2.prop, value: image2.value.trim(), from: image2.from };
   const outline = edgePainted(n, "outline", [""], state, box);
   if (outline) return outline;
   const mask = winnerOf(
@@ -1721,13 +1919,79 @@ function pseudoPaints(
     })
   )
     return { prop: "filter", value: filter.value.trim(), from: filter.from };
+  // Every other property the pseudo's rules set, read through the cascade: a backdrop filter,
+  // a blend mode, a clip path. Only the custom properties and the families above are not.
+  const others = new Set<string>();
+  for (const r of boxRules(box)) for (const d of r.decls) others.add(d.prop);
+  for (const prop of others) {
+    if (
+      prop.startsWith("--") ||
+      prop === "content" ||
+      PSEUDO_SAFE.test(prop) ||
+      /^(background(-|$)|box-shadow$|border(-|$)|outline(-|$)|mask(-|$)|-webkit-mask(-|$)|filter$)/.test(
+        prop,
+      )
+    )
+      continue;
+    const w = winner(n, prop, state, { box });
+    if (!w) continue;
+    const value = expandVars(w.value, n, state, 0, box).trim();
+    if (
+      !neutral(prop, value, (name) => {
+        const v = varOf(n, name, state, box);
+        return v === undefined ? [] : [v];
+      })
+    )
+      return { prop, value, from: w.from };
+  }
   return undefined;
 }
 
+/** The width of an edge keyword or length, in px. */
+function lineWidthPx(width: string, n: Element, state: State): number {
+  const w = width.trim().toLowerCase();
+  if (w === "thin") return 1;
+  if (w === "medium") return 3;
+  if (w === "thick") return 5;
+  return naming(n, "line width", () => pxOf(expandVars(w, n, state)));
+}
+
+/** The width of one side of `n`'s border in px: zero when its style is none or hidden. */
+function borderPx(n: Element, side: string, state: State): number {
+  const style = edgePart(n, "border", side, "style", state);
+  if (!style || /^(none|hidden)$/i.test(style.value)) return 0;
+  return lineWidthPx(edgePart(n, "border", side, "width", state)?.value ?? "medium", n, state);
+}
+
+/** The padding of one side of `n` in px. */
+function paddingPx(n: Element, side: Side, state: State): number {
+  const axis = side === "top" || side === "bottom" ? "block" : "inline";
+  const w = winnerOf(n, [`padding-${side}`, `padding-${axis}`, "padding"], state);
+  if (!w) return 0;
+  const words = topWords(expandVars(w.value, n, state).trim());
+  const pick =
+    w.prop === "padding"
+      ? pickSide(words, side)
+      : w.prop === `padding-${axis}`
+        ? pickAxis(words, side)
+        : words[0];
+  return naming(n, `padding-${side}`, () => pxOf(pick));
+}
+
+/** The least distance from `n`'s border edge to where its content starts, over its four sides,
+ *  in px: a border plus a padding. Text can sit that close to any side. */
+function clearancePx(n: Element, state: State): number {
+  const sides: Side[] = ["top", "right", "bottom", "left"];
+  return Math.min(
+    ...sides.map((side) => borderPx(n, `-${side}`, state) + paddingPx(n, side, state)),
+  );
+}
+
 /** Throw when `n` paints a fill that `groundOf` does not measure, in `state`: an inset
- *  box-shadow layer that paints, or an outline with a negative offset that paints (both on
- *  `n`), or, on `n`'s `::before` or `::after`, a background, border, outline, box-shadow,
- *  mask or filter that paints a box. Outer shadows on `n` are not read. */
+ *  box-shadow layer that reaches the content, or an outline with a negative offset that reaches
+ *  it (both on `n`), or, on `n`'s `::before` or `::after`, a fill that paints a box under the
+ *  text. Outer shadows on `n` are not read; an inset fill or an inward outline that stops short
+ *  of the content (a focus ring inside the padding) is not refused. */
 function refuseFills(n: Element, state: State) {
   withState(n, state, () => {
     const tag = n.tagName.toLowerCase();
@@ -1736,18 +2000,33 @@ function refuseFills(n: Element, state: State) {
     if (shadow !== undefined)
       for (const layer of splitList(expandVars(shadow, n, state))) {
         if (!topWords(layer).some((w) => w.toLowerCase() === "inset")) continue;
-        if (shadowPaints(layer, n, state, `box-shadow layer "${layer}"`))
+        if (!shadowPaints(layer, n, state, `box-shadow layer "${layer}"`)) continue;
+        // The layer reaches inward by its blur and spread, and its offsets, at most.
+        const [x = 0, y = 0, blur = 0, spread = 0] = topWords(layer)
+          .filter((w) => w.toLowerCase() !== "inset" && isLength(w))
+          .map((w) => Math.abs(naming(n, `box-shadow "${layer}"`, () => pxOf(w))));
+        const reach = x + y + blur + spread;
+        if (reach >= clearancePx(n, state))
           throw new Error(
-            `box-shadow "${layer.trim()}" paints an inset fill on <${tag} class="${cls}">; theme-colors does not measure through an inset box-shadow`,
+            `box-shadow "${layer.trim()}" paints an inset fill that reaches the content of <${tag} class="${cls}">; theme-colors does not measure through an inset box-shadow`,
           );
       }
     const offset = winnerOf(n, ["outline-offset"], state)?.value;
-    if (offset !== undefined && isNegative(expandVars(offset, n, state))) {
+    if (offset !== undefined) {
       const outline = edgePainted(n, "outline", [""], state);
-      if (outline)
-        throw new Error(
-          `outline "${outline.value}" with outline-offset "${offset.trim()}" paints over the content of <${tag} class="${cls}">; theme-colors does not measure an inward outline`,
+      if (outline) {
+        const off = naming(n, `outline-offset "${offset.trim()}"`, () =>
+          pxOf(expandVars(offset, n, state)),
         );
+        if (off < 0) {
+          const width = edgePart(n, "outline", "", "width", state);
+          const reach = -off + lineWidthPx(width?.value ?? "medium", n, state);
+          if (reach >= clearancePx(n, state))
+            throw new Error(
+              `outline "${outline.value}" with outline-offset "${offset.trim()}" paints over the content of <${tag} class="${cls}">; theme-colors does not measure an inward outline`,
+            );
+        }
+      }
     }
     for (const box of ["before", "after"] as const) {
       const hit = pseudoPaints(n, box, state);
@@ -1768,6 +2047,13 @@ function refuseFills(n: Element, state: State) {
 export function groundOf(
   el: Element,
   opts: { within?: Element; under?: Rgba | string; state?: State } = {},
+): Rgba {
+  return scan(() => groundIn(el, opts));
+}
+
+function groundIn(
+  el: Element,
+  opts: { within?: Element; under?: Rgba | string; state?: State },
 ): Rgba {
   const layers: Rgba[] = [];
   const state = opts.state ?? {};
