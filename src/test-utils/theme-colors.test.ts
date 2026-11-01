@@ -461,7 +461,7 @@ describe("theme-colors", () => {
     }
   });
 
-  it("refuses a fill painted over the ground by an inset shadow or a ::before, and reads no outer shadow", () => {
+  it("refuses a fill painted over the ground by an inset shadow, an outline, or a ::before or ::after, and reads no outer shadow", () => {
     // The sliding fills of a hover state: hovered, the label is white on a
     // white fill (the CtaBanner mutants of review round 5).
     const known: [string, RegExp][] = [
@@ -475,6 +475,26 @@ describe("theme-colors", () => {
         /::after/,
       ],
       ["border-white text-white hover:inset-ring-[20rem] hover:inset-ring-white", /inset/],
+      // The review's round-6 mutants: a gradient or an image on a ::before, a border on an
+      // ::after, and an outline whose negative offset lays it across the label.
+      [
+        "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:bg-linear-to-r hover:before:from-white hover:before:to-white",
+        /::before/,
+      ],
+      [
+        "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:[background-image:linear-gradient(white,white)]",
+        /::before/,
+      ],
+      [
+        "relative isolate overflow-hidden border-white text-white after:absolute after:inset-0 after:-z-10 hover:after:border-[20rem] hover:after:border-white",
+        /::after/,
+      ],
+      [
+        "border-white text-white hover:outline-[20rem] hover:outline-white hover:-outline-offset-[20rem]",
+        /outline/,
+      ],
+      // A Tailwind ring whose width is 20rem is an inset shadow; the throw names it.
+      ["border-white text-white hover:ring-inset hover:ring-[20rem] hover:ring-white", /inset/],
     ];
     for (const [cls, why] of known) {
       const p = el(`<div class="bg-dark"><a data-probe class="${cls}">x</a></div>`);
@@ -493,6 +513,36 @@ describe("theme-colors", () => {
       '<div class="bg-dark"><a data-probe class="relative text-white before:bg-transparent hover:before:bg-transparent">x</a></div>',
     );
     expect(groundOf(clear, { state: { hover: true } })).toEqual(themeColour("dark"));
+  });
+
+  it("reads a fill that paints nothing as unpainted, whatever spelling gives it", () => {
+    // Each is a known-good for the fill check: transparent, zero-alpha, zero-width or
+    // not-a-box-shadow forms of "no fill" that a designer writes instead of `transparent`.
+    const clear = [
+      "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:bg-white/0",
+      "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:bg-[rgb(0_0_0/0)]",
+      "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:shadow-none",
+      "border-white text-white hover:inset-shadow-[0_0_0_20rem] hover:inset-shadow-white/0",
+      "border-white text-white ring-inset ring-0 ring-white",
+      // An outline with no width, or a transparent colour, paints nothing, even inward.
+      "border-white text-white hover:-outline-offset-[20rem]",
+      "border-white text-white hover:outline-[20rem] hover:outline-transparent hover:-outline-offset-[20rem]",
+    ];
+    for (const cls of clear) {
+      const p = el(`<div class="bg-dark"><a data-probe class="${cls}">x</a></div>`);
+      expect(groundOf(p, { state: { hover: true } }), cls).toEqual(themeColour("dark"));
+    }
+    // A Tailwind shadow on an ancestor is not the child's: `--tw-*` does not inherit, so a
+    // focus-ringed link inside `shadow-inner` has no inset layer of its own.
+    const inner = el(
+      '<div class="shadow-inner"><div class="bg-dark"><a data-probe class="text-white focus-visible:ring-2 focus-visible:ring-gold">x</a></div></div>',
+    );
+    expect(groundOf(inner, { state: { focusVisible: true } })).toEqual(themeColour("dark"));
+    // An outward outline sits outside the box, so it is not read.
+    const outward = el(
+      '<div class="bg-dark"><a data-probe class="text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">x</a></div>',
+    );
+    expect(groundOf(outward, { state: { focusVisible: true } })).toEqual(themeColour("dark"));
   });
 
   it("reads (hover: hover) only for a rule that needs :hover, and never on a device that cannot", () => {

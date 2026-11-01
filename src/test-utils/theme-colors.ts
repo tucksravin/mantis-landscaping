@@ -66,12 +66,17 @@ import { compile } from "tailwindcss";
  *     naming the class. Neutral values (`none`, `normal`, an unset
  *     filter chain) are read as what they are;
  *   - fills painted over the ground, which `groundOf` refuses, naming the
- *     class: an `inset` box-shadow with a colour that is not transparent,
- *     read from the resolved `box-shadow` (so Tailwind's `--tw-shadow`,
- *     `--tw-inset-shadow` and `--tw-inset-ring-shadow` chain counts), on the
- *     element or an ancestor up to its ground; and a `::before` or `::after`
- *     that sets a `background`, `background-color` or `box-shadow` (the
- *     sliding fill of a hover state), on either. Outer shadows are not read;
+ *     class: an `inset` box-shadow layer that paints (a colour with alpha,
+ *     unless its spread, blur and offsets are all 0), read from the resolved
+ *     `box-shadow` on the element or an ancestor up to its ground, with
+ *     Tailwind's `--tw-*` variables resolved from each element's own rules
+ *     (they do not inherit; a `@property` initial value stands in for an
+ *     unset one); an outline with a negative `outline-offset` that paints
+ *     (style, width and colour, `currentColor` included), on the element; and
+ *     a `::before` or `::after` that paints a box by any of: a background
+ *     colour or image, a border side, an outline, a box-shadow layer, a mask
+ *     or a filter (the sliding fill of a hover state), on either. Outer
+ *     shadows on the element are not read;
  *   - the pseudo-elements that restyle the element's own text or its
  *     content (`::first-line`, `::first-letter`, `::selection` and the other
  *     highlights, `::details-content`): never modelled, so a rule that sets
@@ -87,8 +92,9 @@ import { compile } from "tailwindcss";
  * not load them), and the text of another box: `::before`, `::after`,
  * `::marker`, `::placeholder`, `::file-selector-button` and `::backdrop` are
  * skipped, so their colours are not checked. A `::before` or `::after` that
- * paints a fill is refused by `groundOf` (above). Out-of-gamut oklch is
- * clipped to sRGB.
+ * paints a box is refused by `groundOf` (above). A positioned child that
+ * paints a fill (`<span class="absolute inset-0 -z-10 bg-white">`) is not
+ * read: `groundOf` walks ancestors only. Out-of-gamut oklch is clipped to sRGB.
  */
 
 const root = process.cwd();
@@ -548,7 +554,7 @@ function parsesSelector(x: string): boolean {
  *  Its host is matched as any rule's is. A host this file cannot evaluate throws
  *  in `winner` when it could match, as an unmodelled rule does. */
 function keepFill(sel: string, pe: RegExpExecArray, n: Node, layer: number, ctx: Ctx) {
-  if (!n.decls.some((d) => BOX_PAINT.has(d.prop))) return;
+  if (!n.decls.some((d) => BOX_PAINT.test(d.prop))) return;
   let host = sel.slice(0, pe.index).replace(/\s+$/, " ");
   if (!host.trim() || /[\s>+~]$/.test(host)) host += "*";
   const exact = rewritePseudo(host, false);
@@ -651,12 +657,26 @@ function styleRule(sels: string[], n: Node, layer: number, ctx: Ctx, out: Rule[]
 }
 
 let cached: { size: number; rules: Rule[]; boxes: Rule[]; effects: string[] } | undefined;
+/** The `initial-value` of each `@property` the compiled sheet declares: what a
+ *  custom property with no value of its own takes (Tailwind's `--tw-*` defaults). */
+let initials = new Map<string, string>();
+function initialsOf(nodes: Node[], out: Map<string, string>) {
+  for (const n of nodes) {
+    const at = /^@property\s+(--[\w-]+)/.exec(n.prelude);
+    const init = at && n.decls.find((d) => d.prop === "initial-value");
+    if (at && init) out.set(at[1], init.value.trim());
+    initialsOf(n.children, out);
+  }
+}
 const seen = new Set<string>();
 /** Where `styleRule` puts the `::before`/`::after` rules that paint a fill. Set only
  *  while `sheet()` collects, so `rulesOf` (the audit) is unchanged. */
 let boxSink: Rule[] | undefined;
-/** The properties of a `::before` or `::after` that paint a box. */
-const BOX_PAINT = new Set(["background", "background-color", "box-shadow"]);
+/** The properties of a `::before` or `::after` that can paint a box: a rule that sets
+ *  one is kept for `refuseFills`. The `--tw-*` variables are kept too, since a
+ *  pseudo-element's own shadow or ring is built from them. */
+const BOX_PAINT =
+  /^(background(-|$)|box-shadow$|border(-|$)|outline(-|$)|mask(-|$)|-webkit-mask(-|$)|filter$|--tw-)/;
 
 function sheet(): Rule[] {
   for (const el of document.querySelectorAll("[class]")) {
@@ -667,12 +687,10 @@ function sheet(): Rule[] {
   const boxes: Rule[] = [];
   boxSink = boxes;
   try {
-    collect(
-      parse(compiler.build([...seen])),
-      UNLAYERED,
-      { media: [], container: [], unknown: [] },
-      rules,
-    );
+    const tree = parse(compiler.build([...seen]));
+    initials = new Map();
+    initialsOf(tree, initials);
+    collect(tree, UNLAYERED, { media: [], container: [], unknown: [] }, rules);
   } finally {
     boxSink = undefined;
   }
@@ -1180,12 +1198,30 @@ function winner(
 export function computed(el: Element, prop: string, state: State = {}): string | undefined {
   return withState(el, state, () => {
     if (!prop.startsWith("--")) return winner(el, prop, state)?.value;
-    for (let n: Element | null = el; n; n = n.parentElement) {
-      const v = winner(n, prop, state)?.value;
-      if (v !== undefined && v !== "inherit") return v;
-    }
-    return sourceVars.get(prop);
+    return varOf(el, prop, state);
   });
+}
+
+/** A custom property as `el` has it, or as its `box` pseudo-element does. Tailwind's
+ *  `--tw-*` variables do not inherit: the element's own value, else the initial value
+ *  its `@property` gives. A theme variable (`--color-*`) inherits down the DOM. Call
+ *  inside `withState`. */
+function varOf(
+  el: Element,
+  name: string,
+  state: State,
+  box?: "before" | "after",
+): string | undefined {
+  if (name.startsWith("--tw-")) {
+    sheet();
+    const own = winner(el, name, state, box ? { box } : {})?.value;
+    return own !== undefined && own !== "inherit" ? own : initials.get(name);
+  }
+  for (let n: Element | null = el; n; n = n.parentElement) {
+    const v = winner(n, name, state)?.value;
+    if (v !== undefined && v !== "inherit") return v;
+  }
+  return sourceVars.get(name);
 }
 
 /**
@@ -1199,12 +1235,8 @@ export function cascadeWinner(
   state: State = {},
 ): { prop: string; value: string } | undefined {
   return withState(el, state, () => {
-    let best: { prop: string; value: string; key: number[] } | undefined;
-    for (const prop of props) {
-      const w = winner(el, prop, state);
-      if (w && (!best || compareKeys(w.key, best.key) > 0)) best = { prop, ...w };
-    }
-    return best && { prop: best.prop, value: best.value };
+    const w = winnerOf(el, props, state);
+    return w && { prop: w.prop, value: w.value };
   });
 }
 
@@ -1305,10 +1337,14 @@ function parseColour(raw: string, el: Element | null, state: State): Rgba {
     const [r, g, b] = [rgb[1], rgb[2], rgb[3]].map((c) => num(c, 255));
     return { r, g, b, a: rgb[4] === undefined ? 1 : num(rgb[4]) };
   }
-  const mix = /^color-mix\(in (?:srgb|oklab|oklch), (.+?) ([\d.]+)%, transparent\)$/.exec(v);
-  if (mix) {
-    const c = parseColour(mix[1], el, state);
-    return { ...c, a: c.a * (Number(mix[2]) / 100) };
+  // `color-mix(in oklab, X 40%, transparent)`: X may be another color-mix (Tailwind's
+  // `inset-shadow-white/0`), and a missing share is 100%.
+  const mix = /^color-mix\(in (?:srgb|oklab|oklch),\s*(.+)\)$/.exec(v);
+  const parts = mix ? splitList(mix[1]) : [];
+  if (mix && parts.length === 2 && parts[1] === "transparent") {
+    const share = /^(.*\S)\s+([\d.]+)%$/.exec(parts[0]);
+    const c = parseColour(share ? share[1] : parts[0], el, state);
+    return { ...c, a: c.a * (share ? Number(share[2]) / 100 : 1) };
   }
   const lch =
     /^oklch\(\s*([\d.]+%?)\s+([\d.]+%?)\s+(-?[\d.]+)(?:deg)?\s*(?:\/\s*([\d.]+%?)\s*)?\)$/.exec(v);
@@ -1467,54 +1503,260 @@ function topWords(s: string): string[] {
   return out;
 }
 
-/** `value` with each `var(--x, fallback)` replaced by what the cascade gives
- *  `--x` on `el` in `state`, else its fallback, else nothing: the value the
- *  browser resolves. */
-function expandVars(value: string, el: Element, state: State, depth = 0): string {
+/** `value` with each `var(--x, fallback)` replaced by what the cascade gives `--x` on
+ *  `el` (or its `box`) in `state`, else its fallback, else nothing: the value the browser
+ *  resolves. */
+function expandVars(
+  value: string,
+  el: Element,
+  state: State,
+  depth = 0,
+  box?: "before" | "after",
+): string {
   if (depth > 8)
     throw new Error(`theme-colors cannot resolve "${value}": its variables nest too deep`);
   return value.replace(
     /var\((--[\w-]+)(?:,\s*((?:[^()]|\([^()]*\))*))?\)/g,
     (_, name: string, fallback?: string) => {
-      const v = computed(el, name, state);
+      const v = withState(el, state, () => varOf(el, name, state, box));
       const chosen = v === undefined || v === "initial" ? (fallback ?? "") : v;
-      return expandVars(chosen, el, state, depth + 1);
+      return expandVars(chosen, el, state, depth + 1, box);
     },
   );
 }
 
 const UNPAINTED = /^(none|initial|unset|revert|transparent)$/;
 
-/** Throw when `n` paints a fill that `groundOf` does not measure, in `state`:
- *  an inset box-shadow with a colour that is not transparent, or a `::before`
- *  or `::after` that sets a background or a box-shadow. Outer shadows are not
- *  read. */
-function refuseFills(n: Element, state: State) {
-  const shadow = withState(n, state, () =>
-    winner(n, "box-shadow", state, { neutralUnmodelled: true }),
-  )?.value;
-  if (shadow !== undefined) {
-    for (const layer of splitList(expandVars(shadow, n, state))) {
-      const words = topWords(layer);
-      if (!words.some((w) => w.toLowerCase() === "inset")) continue;
-      const colour = words
-        .filter((w) => w.toLowerCase() !== "inset" && !/^-?[\d.]+[a-z%]*$/i.test(w))
-        .join(" ");
-      const c = parseColour(colour || "currentcolor", n, state);
-      if (c.a > 0)
-        throw new Error(
-          `box-shadow "${layer.trim()}" paints an inset fill on <${n.tagName.toLowerCase()} class="${n.getAttribute("class") ?? ""}">; theme-colors does not measure through an inset box-shadow`,
-        );
-    }
+/** The sides a border can name: the physical four, and the logical ones a `border-x` or
+ *  `border-s` utility sets. The all-sides `border` shorthand is the empty side. */
+const BORDER_SIDES = [
+  "",
+  "-top",
+  "-right",
+  "-bottom",
+  "-left",
+  "-inline",
+  "-block",
+  "-inline-start",
+  "-inline-end",
+  "-block-start",
+  "-block-end",
+];
+const LINE_STYLE = /^(none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset)$/i;
+const LINE_WIDTH = /^(thin|medium|thick)$/i;
+const LENGTH = /^[-+]?(\d+\.?\d*|\.\d+)(px|rem|em|%|ch|ex|vw|vh|cm|mm|in|pt|pc)?$/i;
+
+/** A length word: a number with a unit, or a `calc()`. */
+const isLength = (w: string) => LENGTH.test(w) || /^calc\(/i.test(w);
+/** A zero length, or a `calc()` whose every number is zero. */
+const isZeroLength = (w: string) =>
+  isLength(w) && [...w.matchAll(/\d*\.?\d+/g)].every(([n]) => Number(n) === 0);
+
+/** Whether a length is below zero: a leading minus, or a minus that a `calc()` multiplies
+ *  by (Tailwind writes `-outline-offset-*` as `calc(20rem * -1)`). A sum is not read. */
+function isNegative(v: string): boolean {
+  const s = v.trim().toLowerCase();
+  if (!isLength(s) || isZeroLength(s)) return false;
+  const minuses = (s.replace(/^calc\(/, "(").match(/(^|[(*/])\s*-/g) ?? []).length;
+  return minuses % 2 === 1;
+}
+
+/** Run `fn`; a failure rethrows naming `what` and the element's class, so a reader of the
+ *  error finds the fill, not a bare colour it could not parse. */
+function naming<T>(n: Element, what: string, fn: () => T): T {
+  try {
+    return fn();
+  } catch (e) {
+    throw new Error(
+      `${what} on <${n.tagName.toLowerCase()} class="${n.getAttribute("class") ?? ""}"> cannot be read: ${(e as Error).message}`,
+      { cause: e },
+    );
   }
-  for (const box of ["before", "after"] as const)
-    for (const prop of BOX_PAINT) {
-      const w = withState(n, state, () => winner(n, prop, state, { box }));
-      if (w && !UNPAINTED.test(w.value.trim().toLowerCase()))
+}
+
+/** `parseColour` on a value a fill declares, naming the layer on a failure. */
+function colourIn(text: string, n: Element, state: State, what: string): Rgba {
+  return naming(n, what, () => parseColour(text, n, state));
+}
+
+/** Whether one box-shadow layer paints: its colour has alpha, unless its spread, blur and
+ *  offsets are all zero (a layer of zeros is no fill). `layer` is one comma-separated part. */
+function shadowPaints(layer: string, n: Element, state: State, what: string): boolean {
+  const words = topWords(layer).filter((w) => w.toLowerCase() !== "inset");
+  const lengths = words.filter(isLength);
+  if (lengths.length && lengths.every(isZeroLength)) return false;
+  const colour = words.filter((w) => !isLength(w)).join(" ") || "currentcolor";
+  return colourIn(colour, n, state, what).a > 0;
+}
+
+/** The winner among `props` (a shorthand and its longhands, which set one thing), with the
+ *  selector it came from. Call inside `withState`. */
+function winnerOf(
+  el: Element,
+  props: string[],
+  state: State,
+  box?: "before" | "after",
+): (Win & { prop: string }) | undefined {
+  let best: (Win & { prop: string }) | undefined;
+  for (const prop of props) {
+    const w = winner(el, prop, state, box ? { box } : {});
+    if (w && (!best || compareKeys(w.key, best.key) > 0)) best = { prop, ...w };
+  }
+  return best;
+}
+
+type Part = "width" | "style" | "colour";
+
+/** The words of a border or outline shorthand, split into the part each one sets. */
+function edgeWords(value: string): Partial<Record<Part, string>> {
+  const out: Partial<Record<Part, string>> = {};
+  const colour: string[] = [];
+  for (const w of topWords(value)) {
+    if (LINE_STYLE.test(w)) out.style = w;
+    else if (isLength(w) || LINE_WIDTH.test(w)) out.width = w;
+    else colour.push(w);
+  }
+  if (colour.length) out.colour = colour.join(" ");
+  return out;
+}
+
+/** One part (`width`, `style` or `colour`) of one side of `family` on `n` or its `box`: the
+ *  longhand's own value, or a shorthand's share of its words. Undefined when the cascade
+ *  gives none. Call inside `withState`. */
+function edgePart(
+  n: Element,
+  family: "border" | "outline",
+  side: string,
+  part: Part,
+  state: State,
+  box?: "before" | "after",
+): { value: string; from: string } | undefined {
+  const suffix = part === "colour" ? "color" : part;
+  const props = [
+    ...new Set([family, `${family}-${suffix}`, `${family}${side}`, `${family}${side}-${suffix}`]),
+  ];
+  const w = winnerOf(n, props, state, box);
+  if (!w) return undefined;
+  const value = expandVars(w.value, n, state, 0, box).trim();
+  const shorthand = w.prop === family || w.prop === `${family}${side}`;
+  const picked = shorthand ? edgeWords(value)[part] : value;
+  return picked ? { value: picked, from: w.from } : undefined;
+}
+
+/** The first side of `family` that paints on `n` or its `box` in `state`: a style that is not
+ *  none or hidden, a width that is not zero, and a colour with alpha. The initial values
+ *  stand in for an unset part: style none, width medium, colour currentcolor. */
+function edgePainted(
+  n: Element,
+  family: "border" | "outline",
+  sides: string[],
+  state: State,
+  box?: "before" | "after",
+): { prop: string; value: string; from: string } | undefined {
+  for (const side of sides) {
+    const style = edgePart(n, family, side, "style", state, box);
+    if (!style || /^(none|hidden)$/i.test(style.value)) continue;
+    const width = edgePart(n, family, side, "width", state, box)?.value ?? "medium";
+    if (isZeroLength(width)) continue;
+    const colour = edgePart(n, family, side, "colour", state, box)?.value ?? "currentcolor";
+    if (colourIn(colour, n, state, `${family}${side} colour`).a > 0)
+      return {
+        prop: `${family}${side}`,
+        value: `${width} ${style.value} ${colour}`,
+        from: style.from,
+      };
+  }
+  return undefined;
+}
+
+/** Whether a background image paints: a `background-image` that is not none, or a
+ *  `background` shorthand that names an image or a gradient. */
+function paintsImage(prop: string, value: string): boolean {
+  return prop === "background-image"
+    ? !/^(none|initial|unset|revert)$/.test(value)
+    : /\b(url|gradient|image|image-set|element)\(/.test(value);
+}
+
+/** The first property of `n`'s `box` that paints a box in `state`: a background (an image,
+ *  or a colour with alpha), a box-shadow layer that paints, a border or outline side that
+ *  paints, a mask that is not none, or a filter that is not neutral. Undefined when none does. */
+function pseudoPaints(
+  n: Element,
+  box: "before" | "after",
+  state: State,
+): { prop: string; value: string; from: string } | undefined {
+  const image = winnerOf(n, ["background-image", "background"], state, box);
+  if (image) {
+    const value = expandVars(image.value, n, state, 0, box).trim();
+    if (paintsImage(image.prop, value)) return { prop: image.prop, value, from: image.from };
+  }
+  const fill = winnerOf(n, ["background-color", "background"], state, box);
+  if (fill) {
+    const bg = naming(n, `::${box} ${fill.prop}`, () => readBackground(fill, n, state, box));
+    if (bg.a > 0) return { prop: fill.prop, value: fill.value.trim(), from: fill.from };
+  }
+  const shadow = winnerOf(n, ["box-shadow"], state, box);
+  if (shadow)
+    for (const layer of splitList(expandVars(shadow.value, n, state, 0, box)))
+      if (layer && shadowPaints(layer, n, state, `::${box} box-shadow layer "${layer}"`))
+        return { prop: "box-shadow", value: shadow.value.trim(), from: shadow.from };
+  const border = edgePainted(n, "border", BORDER_SIDES, state, box);
+  if (border) return border;
+  const outline = edgePainted(n, "outline", [""], state, box);
+  if (outline) return outline;
+  const mask = winnerOf(
+    n,
+    ["mask", "mask-image", "-webkit-mask", "-webkit-mask-image"],
+    state,
+    box,
+  );
+  if (mask && !neutral(mask.prop, expandVars(mask.value, n, state, 0, box), () => []))
+    return { prop: mask.prop, value: mask.value.trim(), from: mask.from };
+  const filter = winnerOf(n, ["filter"], state, box);
+  if (
+    filter &&
+    !neutral("filter", filter.value, (name) => {
+      const v = varOf(n, name, state, box);
+      return v === undefined ? [] : [v];
+    })
+  )
+    return { prop: "filter", value: filter.value.trim(), from: filter.from };
+  return undefined;
+}
+
+/** Throw when `n` paints a fill that `groundOf` does not measure, in `state`: an inset
+ *  box-shadow layer that paints, or an outline with a negative offset that paints (both on
+ *  `n`), or, on `n`'s `::before` or `::after`, a background, border, outline, box-shadow,
+ *  mask or filter that paints a box. Outer shadows on `n` are not read. */
+function refuseFills(n: Element, state: State) {
+  withState(n, state, () => {
+    const tag = n.tagName.toLowerCase();
+    const cls = n.getAttribute("class") ?? "";
+    const shadow = winner(n, "box-shadow", state, { neutralUnmodelled: true })?.value;
+    if (shadow !== undefined)
+      for (const layer of splitList(expandVars(shadow, n, state))) {
+        if (!topWords(layer).some((w) => w.toLowerCase() === "inset")) continue;
+        if (shadowPaints(layer, n, state, `box-shadow layer "${layer}"`))
+          throw new Error(
+            `box-shadow "${layer.trim()}" paints an inset fill on <${tag} class="${cls}">; theme-colors does not measure through an inset box-shadow`,
+          );
+      }
+    const offset = winnerOf(n, ["outline-offset"], state)?.value;
+    if (offset !== undefined && isNegative(expandVars(offset, n, state))) {
+      const outline = edgePainted(n, "outline", [""], state);
+      if (outline)
         throw new Error(
-          `${prop} "${w.value}" on ::${box} of <${n.tagName.toLowerCase()} class="${n.getAttribute("class") ?? ""}"> paints a fill that theme-colors does not measure (from "${w.from}")`,
+          `outline "${outline.value}" with outline-offset "${offset.trim()}" paints over the content of <${tag} class="${cls}">; theme-colors does not measure an inward outline`,
         );
     }
+    for (const box of ["before", "after"] as const) {
+      const hit = pseudoPaints(n, box, state);
+      if (hit)
+        throw new Error(
+          `${hit.prop} "${hit.value}" on ::${box} of <${tag} class="${cls}"> paints a fill that theme-colors does not measure (from "${hit.from}")`,
+        );
+    }
+  });
 }
 
 /**
@@ -1562,16 +1804,21 @@ export function groundOf(
   return layers.reduceRight((acc, layer) => over(layer, acc), base);
 }
 
-/** The colour a `background-color` or `background` declaration paints. The
- *  shorthand is read only when it is a bare colour; anything else throws. */
-function readBackground(w: { prop: string; value: string }, el: Element, state: State): Rgba {
-  if (w.prop === "background" && /^(none|initial|unset|revert)$/.test(w.value))
-    return NAMED.transparent;
+/** The colour a `background-color` or `background` declaration paints on `el` (or its
+ *  `box`). The shorthand is read only when it is a bare colour; anything else throws. */
+function readBackground(
+  w: { prop: string; value: string },
+  el: Element,
+  state: State,
+  box?: "before" | "after",
+): Rgba {
+  const value = expandVars(w.value, el, state, 0, box).trim();
+  if (/^(none|initial|unset|revert)$/i.test(value)) return NAMED.transparent;
   try {
-    return parseColour(w.value, el, state);
+    return parseColour(value, el, state);
   } catch (e) {
     if (w.prop === "background")
-      throw new Error(`theme-colors cannot read the background shorthand "${w.value}"`, {
+      throw new Error(`theme-colors cannot read the background shorthand "${value}"`, {
         cause: e,
       });
     throw e;
