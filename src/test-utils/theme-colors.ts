@@ -65,6 +65,13 @@ import { compile } from "tailwindcss";
  *     `textColour`, `groundOf`, `opacityOf`, `colourOf` and `everyColour`,
  *     naming the class. Neutral values (`none`, `normal`, an unset
  *     filter chain) are read as what they are;
+ *   - fills painted over the ground, which `groundOf` refuses, naming the
+ *     class: an `inset` box-shadow with a colour that is not transparent,
+ *     read from the resolved `box-shadow` (so Tailwind's `--tw-shadow`,
+ *     `--tw-inset-shadow` and `--tw-inset-ring-shadow` chain counts), on the
+ *     element or an ancestor up to its ground; and a `::before` or `::after`
+ *     that sets a `background`, `background-color` or `box-shadow` (the
+ *     sliding fill of a hover state), on either. Outer shadows are not read;
  *   - the pseudo-elements that restyle the element's own text or its
  *     content (`::first-line`, `::first-letter`, `::selection` and the other
  *     highlights, `::details-content`): never modelled, so a rule that sets
@@ -79,8 +86,9 @@ import { compile } from "tailwindcss";
  * What it does not measure: Svelte's scoped component styles (vitest does
  * not load them), and the text of another box: `::before`, `::after`,
  * `::marker`, `::placeholder`, `::file-selector-button` and `::backdrop` are
- * skipped, so their colours are not checked. Out-of-gamut oklch is clipped
- * to sRGB.
+ * skipped, so their colours are not checked. A `::before` or `::after` that
+ * paints a fill is refused by `groundOf` (above). Out-of-gamut oklch is
+ * clipped to sRGB.
  */
 
 const root = process.cwd();
@@ -224,6 +232,8 @@ interface Rule extends Ctx {
   layer: number;
   order: number;
   decls: Decl[];
+  /** Set on a `::before` or `::after` fill (kept out of `rules`, see `boxSink`). */
+  box?: "before" | "after";
 }
 
 // At-rules whose blocks never style an element on screen: keyframe steps,
@@ -524,6 +534,45 @@ function collect(nodes: Node[], layer: number, ctx: Ctx, out: Rule[]) {
   }
 }
 
+/** Whether jsdom's selector engine accepts `x`. */
+function parsesSelector(x: string): boolean {
+  try {
+    document.documentElement.matches(x);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A `::before` or `::after` that sets a fill, kept in `boxSink` for `refuseFills`.
+ *  Its host is matched as any rule's is. A host this file cannot evaluate throws
+ *  in `winner` when it could match, as an unmodelled rule does. */
+function keepFill(sel: string, pe: RegExpExecArray, n: Node, layer: number, ctx: Ctx) {
+  if (!n.decls.some((d) => BOX_PAINT.has(d.prop))) return;
+  let host = sel.slice(0, pe.index).replace(/\s+$/, " ");
+  if (!host.trim() || /[\s>+~]$/.test(host)) host += "*";
+  const exact = rewritePseudo(host, false);
+  const open = exact.unmodelled.length > 0 || !parsesSelector(exact.sel);
+  const dropped = open ? rewritePseudo(host, true).sel.trim() || "*" : "";
+  boxSink!.push({
+    selector: sel,
+    test: open ? null : exact.sel,
+    loose: open && parsesSelector(dropped) ? dropped : null,
+    why: open
+      ? exact.unmodelled.length
+        ? `theme-colors does not model ${exact.unmodelled.join(", ")}`
+        : "jsdom cannot parse it"
+      : "",
+    others: exact.others,
+    specificity: specificity(sel),
+    layer: layer < 0 ? UNLAYERED : layer,
+    order: boxSink!.length,
+    ...ctx,
+    decls: n.decls,
+    box: pe[1] as "before" | "after",
+  });
+}
+
 /** A style rule, and the conditional blocks nested in it (`&:hover`, a
  *  forced-colors fallback), each under its parent's selectors. */
 function styleRule(sels: string[], n: Node, layer: number, ctx: Ctx, out: Rule[]) {
@@ -537,6 +586,10 @@ function styleRule(sels: string[], n: Node, layer: number, ctx: Ctx, out: Rule[]
   };
   for (const sel of sels) {
     const pe = /::(-?[\w-]+)/.exec(masked(sel));
+    if (pe && boxSink && /^(before|after)$/.test(pe[1])) {
+      keepFill(sel, pe, n, layer, ctx);
+      continue;
+    }
     if (pe && !OWN_TEXT.has(pe[1])) continue; // another box: not measured
     // `::first-line`, `::selection`, `::details-content`: the element's own
     // glyphs, or its content's, restyled. Never modelled, so a rule that
@@ -597,8 +650,13 @@ function styleRule(sels: string[], n: Node, layer: number, ctx: Ctx, out: Rule[]
   }
 }
 
-let cached: { size: number; rules: Rule[]; effects: string[] } | undefined;
+let cached: { size: number; rules: Rule[]; boxes: Rule[]; effects: string[] } | undefined;
 const seen = new Set<string>();
+/** Where `styleRule` puts the `::before`/`::after` rules that paint a fill. Set only
+ *  while `sheet()` collects, so `rulesOf` (the audit) is unchanged. */
+let boxSink: Rule[] | undefined;
+/** The properties of a `::before` or `::after` that paint a box. */
+const BOX_PAINT = new Set(["background", "background-color", "box-shadow"]);
 
 function sheet(): Rule[] {
   for (const el of document.querySelectorAll("[class]")) {
@@ -606,15 +664,22 @@ function sheet(): Rule[] {
   }
   if (cached && cached.size === seen.size) return cached.rules;
   const rules: Rule[] = [];
-  collect(
-    parse(compiler.build([...seen])),
-    UNLAYERED,
-    { media: [], container: [], unknown: [] },
-    rules,
-  );
+  const boxes: Rule[] = [];
+  boxSink = boxes;
+  try {
+    collect(
+      parse(compiler.build([...seen])),
+      UNLAYERED,
+      { media: [], container: [], unknown: [] },
+      rules,
+    );
+  } finally {
+    boxSink = undefined;
+  }
   cached = {
     size: seen.size,
     rules,
+    boxes,
     effects: EFFECTS.filter((p) => rules.some((r) => r.decls.some((d) => d.prop === p))),
   };
   return rules;
@@ -1036,16 +1101,37 @@ function namesClassOf(rule: Rule, el: Element): boolean {
   });
 }
 
-/** The winning declaration of `prop` on `el` itself (no inheritance). */
-function winner(el: Element, prop: string, state: State): Win | undefined {
+/** The `::before` or `::after` rules that paint a fill, for `winner`. */
+function boxRules(box: "before" | "after"): Rule[] {
+  sheet();
+  return cached!.boxes.filter((r) => r.box === box);
+}
+
+/** The winning declaration of `prop` on `el` itself (no inheritance), or of
+ *  `prop` on its `box` pseudo-element. */
+function winner(
+  el: Element,
+  prop: string,
+  state: State,
+  opts: { box?: "before" | "after"; neutralUnmodelled?: boolean } = {},
+): Win | undefined {
+  const box = opts.box;
   let best: Win | undefined;
   const consider = (value: string, key: number[], from: string) => {
     if (!best || compareKeys(key, best.key) > 0) best = { value, key, from };
   };
-  for (const r of sheet()) {
+  for (const r of box ? boxRules(box) : sheet()) {
     const decls = r.decls.filter((d) => d.prop === prop);
     if (!decls.length) continue;
     if (r.test === null) {
+      // A declared `none` paints nothing, so it cannot decide a fill. Passed over
+      // only where `neutralUnmodelled` says so (preflight's `:-moz-ui-invalid {
+      // box-shadow: none }` would otherwise refuse every element).
+      if (
+        opts.neutralUnmodelled &&
+        decls.every((d) => UNPAINTED.test(d.value.trim().toLowerCase()))
+      )
+        continue;
       if (namesClassOf(r, el) || (r.loose !== null && el.matches(r.loose)))
         throw new Error(
           `"${r.selector}" may set ${prop} on <${el.tagName.toLowerCase()} class="${el.getAttribute("class") ?? ""}">, and ${r.why}`,
@@ -1076,7 +1162,8 @@ function winner(el: Element, prop: string, state: State): Win | undefined {
       consider(d.value, [d.important ? 1 : 0, 0, layer, r.specificity, r.order], r.selector);
     }
   }
-  const style = (el as HTMLElement).style;
+  // A pseudo-element has no style attribute of its own.
+  const style = box ? undefined : (el as HTMLElement).style;
   const inline = style?.getPropertyValue(prop);
   if (inline) {
     const important = style.getPropertyPriority(prop) === "important";
@@ -1363,6 +1450,73 @@ export function over(top: Rgba | string, bottom: Rgba | string, alpha = 1): Rgba
   return { r: ch("r"), g: ch("g"), b: ch("b"), a };
 }
 
+/** `s` split on whitespace outside parentheses. */
+function topWords(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of s) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (depth === 0 && /\s/.test(ch)) {
+      if (cur) out.push(cur);
+      cur = "";
+    } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** `value` with each `var(--x, fallback)` replaced by what the cascade gives
+ *  `--x` on `el` in `state`, else its fallback, else nothing: the value the
+ *  browser resolves. */
+function expandVars(value: string, el: Element, state: State, depth = 0): string {
+  if (depth > 8)
+    throw new Error(`theme-colors cannot resolve "${value}": its variables nest too deep`);
+  return value.replace(
+    /var\((--[\w-]+)(?:,\s*((?:[^()]|\([^()]*\))*))?\)/g,
+    (_, name: string, fallback?: string) => {
+      const v = computed(el, name, state);
+      const chosen = v === undefined || v === "initial" ? (fallback ?? "") : v;
+      return expandVars(chosen, el, state, depth + 1);
+    },
+  );
+}
+
+const UNPAINTED = /^(none|initial|unset|revert|transparent)$/;
+
+/** Throw when `n` paints a fill that `groundOf` does not measure, in `state`:
+ *  an inset box-shadow with a colour that is not transparent, or a `::before`
+ *  or `::after` that sets a background or a box-shadow. Outer shadows are not
+ *  read. */
+function refuseFills(n: Element, state: State) {
+  const shadow = withState(n, state, () =>
+    winner(n, "box-shadow", state, { neutralUnmodelled: true }),
+  )?.value;
+  if (shadow !== undefined) {
+    for (const layer of splitList(expandVars(shadow, n, state))) {
+      const words = topWords(layer);
+      if (!words.some((w) => w.toLowerCase() === "inset")) continue;
+      const colour = words
+        .filter((w) => w.toLowerCase() !== "inset" && !/^-?[\d.]+[a-z%]*$/i.test(w))
+        .join(" ");
+      const c = parseColour(colour || "currentcolor", n, state);
+      if (c.a > 0)
+        throw new Error(
+          `box-shadow "${layer.trim()}" paints an inset fill on <${n.tagName.toLowerCase()} class="${n.getAttribute("class") ?? ""}">; theme-colors does not measure through an inset box-shadow`,
+        );
+    }
+  }
+  for (const box of ["before", "after"] as const)
+    for (const prop of BOX_PAINT) {
+      const w = withState(n, state, () => winner(n, prop, state, { box }));
+      if (w && !UNPAINTED.test(w.value.trim().toLowerCase()))
+        throw new Error(
+          `${prop} "${w.value}" on ::${box} of <${n.tagName.toLowerCase()} class="${n.getAttribute("class") ?? ""}"> paints a fill that theme-colors does not measure (from "${w.from}")`,
+        );
+    }
+}
+
 /**
  * The ground `el` is drawn on: every background from `el` outwards,
  * composited, until one is opaque. `within` stops the walk at that ancestor
@@ -1377,6 +1531,7 @@ export function groundOf(
   const state = opts.state ?? {};
   refuseEffects(el, state);
   for (let n: Element | null = el; n; n = n.parentElement) {
+    refuseFills(n, state);
     // A gradient or an image paints over the colour, and its pixels are not
     // a colour this file can measure. Only a caller who says what lies
     // under the element (`under`, for a control over a photo) may pass one.

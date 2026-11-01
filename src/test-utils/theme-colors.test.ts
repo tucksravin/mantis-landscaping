@@ -461,6 +461,40 @@ describe("theme-colors", () => {
     }
   });
 
+  it("refuses a fill painted over the ground by an inset shadow or a ::before, and reads no outer shadow", () => {
+    // The sliding fills of a hover state: hovered, the label is white on a
+    // white fill (the CtaBanner mutants of review round 5).
+    const known: [string, RegExp][] = [
+      ["border-white text-white hover:shadow-[inset_20rem_0_0_0_var(--color-white)]", /inset/],
+      [
+        "relative isolate border-white text-white before:absolute before:inset-0 before:-z-10 hover:before:bg-white",
+        /::before/,
+      ],
+      [
+        "relative isolate border-white text-white after:absolute after:inset-0 after:-z-10 hover:after:bg-white",
+        /::after/,
+      ],
+      ["border-white text-white hover:inset-ring-[20rem] hover:inset-ring-white", /inset/],
+    ];
+    for (const [cls, why] of known) {
+      const p = el(`<div class="bg-dark"><a data-probe class="${cls}">x</a></div>`);
+      expect(() => groundOf(p, { state: { hover: true } }), cls).toThrow(why);
+      expect(() => groundOf(p, { state: { hover: true } }), cls).toThrow(`class="${cls}"`);
+      // Resting, the fill is not painted, so the ground is the band's.
+      expect(groundOf(p), cls).toEqual(themeColour("dark"));
+    }
+    // An outer shadow paints outside the box and is not read.
+    const outer = el(
+      '<div class="bg-dark"><a data-probe class="text-white hover:shadow-[0_0_0_20rem_var(--color-white)]">x</a></div>',
+    );
+    expect(groundOf(outer, { state: { hover: true } })).toEqual(themeColour("dark"));
+    // A ::before that sets no fill (transparent) is not refused.
+    const clear = el(
+      '<div class="bg-dark"><a data-probe class="relative text-white before:bg-transparent hover:before:bg-transparent">x</a></div>',
+    );
+    expect(groundOf(clear, { state: { hover: true } })).toEqual(themeColour("dark"));
+  });
+
   it("reads (hover: hover) only for a rule that needs :hover, and never on a device that cannot", () => {
     const p = el(
       '<div class="bg-dark"><p data-probe class="text-dark [@media(hover:hover)]:[&:not(:hover)]:text-white">x</p></div>',
