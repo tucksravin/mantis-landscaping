@@ -56,8 +56,10 @@ describe("SectionGrid links", () => {
     expect(container.querySelector("a")).toBeNull();
     expect(container.querySelector('[href=""]')).toBeNull();
     expect(container.querySelectorAll("img")).toHaveLength(2);
-    expect(container.querySelector("span.block")).toBeNull();
-    expect(container.querySelectorAll("div.block")).toHaveLength(2);
+    // Block content (the card's h3) is never inside an inline <span>.
+    const titles = [...container.querySelectorAll("h3")];
+    expect(titles).toHaveLength(2);
+    for (const h3 of titles) expect(h3.closest("span")).toBeNull();
   });
 
   it("links a card whose link resolves", () => {

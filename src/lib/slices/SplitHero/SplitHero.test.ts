@@ -2,6 +2,7 @@ import { render, within } from "@testing-library/svelte";
 import { describe, it, expect } from "vitest";
 import type { Content } from "@prismicio/client";
 import SplitHero from "./index.svelte";
+import { contrast, groundOf, textColour, viewportWidths } from "../../../test-utils/theme-colors";
 
 const slice = (tone: string) =>
   ({
@@ -44,9 +45,28 @@ describe("SplitHero slice", () => {
 
   it("puts white type on the darkened gold, never the Blux gold", () => {
     const { container } = render(SplitHero, { props: { slice: slice("gold-deep") } });
-    const panel = container.querySelector(".bg-gold-deep");
-    expect(panel).not.toBeNull();
-    expect(panel?.className).toContain("text-white");
+    const h1 = container.querySelector("h1")!;
+    // At every width the stylesheet distinguishes, since a breakpoint variant
+    // can recolour the heading on a phone or a desktop alone.
+    for (const width of viewportWidths()) {
+      const state = { width };
+      expect(
+        contrast(textColour(h1, state), groundOf(h1, { state })),
+        `heading at ${width}px`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
     expect(container.querySelector(".bg-gold")).toBeNull();
+  });
+
+  it("honours the editor's tone: gold-deep and dark paint different panels", () => {
+    // Distinctness, no colour pinned: a CMS choice that renders the same as the
+    // default silently does nothing.
+    const panel = (tone: string) => {
+      const { container, unmount } = render(SplitHero, { props: { slice: slice(tone) } });
+      const ground = groundOf(container.querySelector("h1")!);
+      unmount();
+      return ground;
+    };
+    expect(panel("gold-deep")).not.toEqual(panel("dark"));
   });
 });

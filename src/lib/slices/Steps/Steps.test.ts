@@ -2,6 +2,8 @@ import { render, within } from "@testing-library/svelte";
 import { describe, it, expect } from "vitest";
 import type { Content } from "@prismicio/client";
 import Steps from "./index.svelte";
+import model from "./model.json";
+import { contrast, groundOf, textColour } from "../../../test-utils/theme-colors";
 
 const steps = [
   {
@@ -58,10 +60,35 @@ describe("Steps slice", () => {
 
   it("keeps the bright Blux gold only under dark type", () => {
     const { container } = render(Steps, { props: { slice: slice(howItWorks, "gold") } });
-    const section = container.querySelector("section");
-    expect(section?.className).toContain("bg-gold");
-    expect(section?.className).toContain("text-primary");
-    expect(section?.className).not.toContain("text-white");
+    const section = container.querySelector("section")!;
+    // Every element that carries text of its own: headings, each step's body,
+    // the call to action.
+    const texts = [...section.querySelectorAll("*")].filter((n) =>
+      [...n.childNodes].some((c) => c.nodeType === 3 && c.textContent!.trim()),
+    );
+    expect(
+      texts.some((n) => n.closest("li") && !n.matches("h2, h3")),
+      "a step's body is measured",
+    ).toBe(true);
+    for (const n of texts)
+      expect(contrast(textColour(n), groundOf(n)), n.textContent!).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("every background the editor can pick paints a distinct ground", () => {
+    const options = (
+      model as unknown as {
+        variations: { primary: { background: { config: { options: string[] } } } }[];
+      }
+    ).variations[0].primary.background.config.options;
+    const grounds = options.map((background) => {
+      const { container, unmount } = render(Steps, {
+        props: { slice: slice(howItWorks, background) },
+      });
+      const ground = groundOf(container.querySelector("section")!);
+      unmount();
+      return JSON.stringify(ground);
+    });
+    expect(new Set(grounds).size, `${options} -> ${grounds}`).toBe(options.length);
   });
 });
 

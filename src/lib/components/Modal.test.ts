@@ -113,17 +113,23 @@ describe("Modal", () => {
 
   // WCAG 2.5.8: the 20px glyph alone is under the 24px minimum. Tailwind
   // preflight zeroes button padding, so the hit target has to come from the
-  // class list — the same min-h-11/min-w-11 (44px) pattern Nav.svelte uses.
-  it("gives the close button a 44px hit target around the 20px icon", () => {
+  // class list. jsdom does no layout, so read the sizing utilities: each axis
+  // needs a min-*/size-*/h-*/w-* step of at least 24px (Tailwind's 4px scale).
+  it("gives the close button at least a 24px hit target (WCAG 2.5.8)", () => {
     const { getByLabelText } = render(Modal, { open: true, children: body() });
 
-    const button = getByLabelText("Close");
-    for (const cls of ["flex", "min-h-11", "min-w-11", "items-center", "justify-center"]) {
-      expect(button.classList.contains(cls), `close button missing ${cls}`).toBe(true);
-    }
-    const icon = button.querySelector("svg")!;
-    expect(icon.getAttribute("width")).toBe("20");
-    expect(icon.getAttribute("height")).toBe("20");
+    const classes = [...getByLabelText("Close").classList].filter((c) => !c.includes(":"));
+    const px = (axis: "h" | "w") =>
+      Math.max(
+        0,
+        ...classes.map((c) => {
+          const m = new RegExp(`^(?:min-${axis}|${axis}|size)-(\\d+(?:\\.\\d+)?)$`).exec(c);
+          const arb = new RegExp(`^(?:min-${axis}|${axis}|size)-\\[(\\d+)px\\]$`).exec(c);
+          return m ? Number(m[1]) * 4 : arb ? Number(arb[1]) : 0;
+        }),
+      );
+    expect(px("h"), "close button height").toBeGreaterThanOrEqual(24);
+    expect(px("w"), "close button width").toBeGreaterThanOrEqual(24);
   });
 });
 
@@ -211,20 +217,5 @@ describe("Modal scroll lock", () => {
     unmount();
     expect(document.body.style.overflow).toBe("clip");
     document.body.style.overflow = "";
-  });
-});
-
-// Tailwind preflight's `*{margin:0}` beats the UA's `dialog{margin:auto}`, and
-// with the UA's `inset:0` still in force that pins the dialog to the top-left
-// corner. `mx-4` restored the horizontal 16px and nothing else.
-//
-// jsdom performs no layout, so this only pins the mechanism; the geometry
-// itself is MEASURED in tests/interaction/modal-centring.spec.ts.
-describe("Modal centring", () => {
-  it("restores auto margins instead of the horizontal-only mx-4", () => {
-    const { container } = render(Modal, { open: true, children: body() });
-    const cls = container.querySelector("dialog")!.getAttribute("class") ?? "";
-    expect(cls, "m-auto against inset:0 is what centres it on both axes").toContain("m-auto");
-    expect(cls, "mx-4 centres one axis and pins the other").not.toContain("mx-4");
   });
 });

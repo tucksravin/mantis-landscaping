@@ -1,20 +1,24 @@
 import { test, expect } from "@playwright/test";
 
-const LOGO_RATIO = 1377 / 153;
-
 for (const width of [1440, 390]) {
   test(`every logo renders at its file's aspect ratio at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/contact-us");
     const boxes = await page.locator('img[src="/logo.png"]').evaluateAll((imgs) =>
-      imgs.map((img) => {
-        const { width: w, height: h } = img.getBoundingClientRect();
-        return { w, h };
-      }),
+      Promise.all(
+        (imgs as HTMLImageElement[]).map(async (img) => {
+          // naturalWidth is 0 until the file has decoded.
+          await img.decode().catch(() => {});
+          const { width: w, height: h } = img.getBoundingClientRect();
+          return { w, h, ratio: img.naturalWidth / img.naturalHeight };
+        }),
+      ),
     );
-    expect(boxes.length).toBe(2);
-    for (const { w, h } of boxes)
-      expect(Math.abs(w / h - LOGO_RATIO) / LOGO_RATIO).toBeLessThan(0.01);
+    expect(boxes.length).toBeGreaterThan(0);
+    // The header and the footer each carry the logo.
+    for (const landmark of ["nav", "footer"])
+      await expect(page.locator(`${landmark} img[src="/logo.png"]`).first()).toBeVisible();
+    for (const { w, h, ratio } of boxes) expect(Math.abs(w / h - ratio) / ratio).toBeLessThan(0.01);
   });
 }
 

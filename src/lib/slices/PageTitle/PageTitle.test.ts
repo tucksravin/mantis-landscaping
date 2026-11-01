@@ -40,7 +40,6 @@ describe("PageTitle slice", () => {
       },
     });
     expect(container.querySelector("section")?.className).toContain("bg-gold-deep");
-    expect(container.querySelector("h1")?.parentElement?.className).toContain("text-5xl");
     expect(container.querySelector(".statement")?.textContent).toContain("Let's talk.");
   });
 

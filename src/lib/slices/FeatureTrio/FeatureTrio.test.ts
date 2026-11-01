@@ -2,6 +2,14 @@ import { render, within } from "@testing-library/svelte";
 import { describe, it, expect } from "vitest";
 import type { Content } from "@prismicio/client";
 import FeatureTrio from "./index.svelte";
+import model from "./model.json";
+
+/** The editor's carousel_below options, read from the model. */
+const breakpoints = (
+  model as unknown as {
+    variations: { primary: Record<string, { config: { options?: string[] } }> }[];
+  }
+).variations[0].primary.carousel_below.config.options!;
 
 const slice = (
   items: { icon: string | null; label: string }[],
@@ -71,32 +79,37 @@ describe("FeatureTrio with nothing to show", () => {
     { icon: null, label: "Beautifully Maintained" },
   ];
 
-  it("at or under the breakpoint the items are a fade carousel; above it, the grid", () => {
-    const { container } = render(FeatureTrio, {
-      props: { slice: slice(pillars, [], { carousel_below: "900", autoplay: null }) },
-    });
-    const grid = container.querySelector("ul") as HTMLElement;
-    expect(grid.className).toContain("[@container(width<=900px)]:hidden");
-    expect(grid.parentElement!.classList.contains("@container")).toBe(true);
-    const carousel = container.querySelector("[data-carousel-below]") as HTMLElement;
-    expect(carousel.className).toContain("[@container(width>900px)]:hidden");
-    expect(within(carousel).getByRole("region").getAttribute("aria-roledescription")).toBe(
-      "carousel",
-    );
-    expect(within(carousel).queryByRole("button", { name: /Pause slides/ })).toBeNull();
-  });
-
-  it("the pillars switch at 900, the values at 600", () => {
-    const values = render(FeatureTrio, {
-      props: { slice: slice(pillars, [], { carousel_below: "600", autoplay: 2000 }) },
-    });
-    expect(values.container.querySelector("ul")!.className).toContain(
-      "[@container(width<=600px)]:hidden",
-    );
-    expect(values.container.querySelector("[data-carousel-below]")!.className).toContain(
-      "[@container(width>600px)]:hidden",
-    );
-  });
+  it.each(breakpoints)(
+    "at or under the editor's breakpoint (%spx) the items are a carousel; above it, the grid",
+    (carousel_below) => {
+      const { container } = render(FeatureTrio, {
+        props: { slice: slice(pillars, [], { carousel_below, autoplay: null }) },
+      });
+      const grid = container.querySelector("ul") as HTMLElement;
+      const carousel = container.querySelector("[data-carousel-below]") as HTMLElement;
+      expect(grid).not.toBeNull();
+      expect(carousel).not.toBeNull();
+      // Each switches at the selected breakpoint, on opposite sides of it.
+      const comparator = (el: HTMLElement) =>
+        new RegExp(`(<=|>=|<|>)\\s*${carousel_below}px`).exec(el.className)?.[1];
+      expect(comparator(grid), "grid names the breakpoint").toBeDefined();
+      expect(comparator(carousel), "carousel names the breakpoint").toBeDefined();
+      // Complementary, so exactly one of the two shows at every width: `<=`
+      // with `>`, or `<` with `>=`. Two that overlap show every feature twice.
+      const complement: Record<string, string> = { "<=": ">", ">": "<=", "<": ">=", ">=": "<" };
+      expect(complement[comparator(grid)!], "grid and carousel never both show").toBe(
+        comparator(carousel),
+      );
+      // A container query only matches inside a size container: with none,
+      // neither hides and both render at every width.
+      expect(grid.parentElement!.closest(".\\@container"), "a @container ancestor").not.toBeNull();
+      expect(carousel.closest(".\\@container"), "a @container ancestor").not.toBeNull();
+      expect(within(carousel).getByRole("region").getAttribute("aria-roledescription")).toBe(
+        "carousel",
+      );
+      expect(within(carousel).queryByRole("button", { name: /Pause slides/ })).toBeNull();
+    },
+  );
 
   it("the values carousel autoplays (and so offers a pause control)", () => {
     const { container } = render(FeatureTrio, {

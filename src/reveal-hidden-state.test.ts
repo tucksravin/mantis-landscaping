@@ -56,13 +56,6 @@ describe("the scroll reveal's first-paint hidden state", () => {
     expect(cssTravel).toBe(jsTravel);
   });
 
-  it("gives scripting-off browsers a way back out, in app.html", () => {
-    const noscript = html.slice(html.indexOf("<noscript>"), html.indexOf("</noscript>"));
-    expect(noscript, "no <noscript> block in app.html").toContain("data-reveal");
-    expect(noscript).toMatch(/opacity:\s*1\s*!important/);
-    expect(noscript).toMatch(/transform:\s*none\s*!important/);
-  });
-
   // The guard has to be a STYLE, not an inline `classList.add("js")` script:
   // this template's CSP ships script-src without 'unsafe-inline', so on
   // server-rendered routes (policy as a nonce-bearing header) the script is

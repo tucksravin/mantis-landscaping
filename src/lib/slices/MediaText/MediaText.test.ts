@@ -30,12 +30,29 @@ describe("MediaText slice", () => {
   });
 
   it("reverses the image/copy order for imageLeft", () => {
-    const { container } = render(MediaText, {
-      props: { slice: makeSlice("imageLeft") },
-    });
-    // the editorial split reverses via grid order: the media column moves ahead
-    // of the copy column on large screens
+    // the editorial split reverses via grid order: the editor's variation, not
+    // the markup, decides which side the media column sits on
+    const orderOf = (variation: "imageRight" | "imageLeft") => {
+      const { container, unmount } = render(MediaText, { props: { slice: makeSlice(variation) } });
+      const media = container.querySelector(".mt-media");
+      expect(media, `${variation} renders the media column`).not.toBeNull();
+      const order = [...media!.classList].filter((c) => /(^|:)order-/.test(c)).join(" ");
+      unmount();
+      return order;
+    };
+    expect(orderOf("imageLeft")).not.toBe(orderOf("imageRight"));
+
+    // And the swap puts the media first: its desktop order sorts before the
+    // copy's (a relation; the numbers are free). Unset order is 0.
+    const { container } = render(MediaText, { props: { slice: makeSlice("imageLeft") } });
+    const lgOrder = (el: Element | null) => {
+      const m = /(?:^|\s)lg:order-(\d+|first|last|none)(?:\s|$)/.exec(el?.className ?? "")?.[1];
+      if (m === undefined || m === "none") return 0;
+      return m === "first" ? -Infinity : m === "last" ? Infinity : Number(m);
+    };
     const media = container.querySelector(".mt-media");
-    expect(media?.className).toContain("lg:order-1");
+    const copy = container.querySelector(".mt-copy");
+    expect(copy, "imageLeft renders the copy column").not.toBeNull();
+    expect(lgOrder(media)).toBeLessThan(lgOrder(copy));
   });
 });

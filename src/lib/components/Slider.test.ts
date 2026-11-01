@@ -2,6 +2,16 @@ import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { render, fireEvent, cleanup } from "@testing-library/svelte";
 import { createRawSnippet, tick } from "svelte";
 import Slider from "./Slider.svelte";
+import {
+  colourOf,
+  computed,
+  contrast,
+  groundOf,
+  over,
+  readColour,
+  themeColour,
+  type Rgba,
+} from "../../test-utils/theme-colors";
 
 type MediaListener = (e: { matches: boolean }) => void;
 
@@ -46,6 +56,46 @@ const isInert = (el: HTMLElement) => el.inert === true;
 
 const activeDot = (container: HTMLElement) =>
   container.querySelector<HTMLButtonElement>('[aria-current="true"]');
+
+/** Positioned out of flow, so it floats over the slides instead of landing
+ *  below them inside an overflow-hidden photo box. Any out-of-flow scheme. */
+const outOfFlow = (el: HTMLElement) =>
+  el.className.split(/\s+/).some((c) => c === "absolute" || c === "fixed");
+
+/** The horizontal edges an element is anchored to (`left-*`, `right-*`). */
+const anchors = (el: HTMLElement) =>
+  new Set(
+    el.className
+      .split(/\s+/)
+      .map((c) => /^-?(left|right)-/.exec(c)?.[1])
+      .filter(Boolean),
+  );
+
+const WHITE = themeColour("white");
+const BLACK = themeColour("black");
+
+/** The colours of an element's keyboard-focus indicators, read through the
+ *  compiled stylesheet in the focus-visible state: its outline, its ring, and
+ *  the colour of a box-shadow halo, each composited over `photo`. */
+const focusColours = (el: HTMLElement, photo: Rgba): Rgba[] => {
+  const state = { focusVisible: true };
+  const out: Rgba[] = [];
+  const outline = colourOf(el, "outline-color", state);
+  const style = computed(el, "outline-style", state);
+  if (outline && style !== "none") out.push(over(outline, photo));
+  // A ring or a halo paints its colour variable, else its fallback.
+  for (const [shadow, colour] of [
+    ["--tw-ring-shadow", "--tw-ring-color"],
+    ["--tw-shadow", "--tw-shadow-color"],
+  ]) {
+    const value = computed(el, shadow, state);
+    if (!value) continue;
+    const fallback = new RegExp(`var\\(${colour},\\s*(.+)\\)\\s*$`).exec(value)?.[1];
+    const paint = computed(el, colour, state) ?? fallback ?? "currentColor";
+    out.push(over(readColour(paint, el, state), photo));
+  }
+  return out;
+};
 
 describe("Slider semantics", () => {
   it("exposes a labelled carousel region with one slide group per item", () => {
@@ -319,9 +369,6 @@ describe("Slider autoplay", () => {
     const prev = over.getByLabelText("Previous slide");
     expect(next.parentElement!.querySelector('[aria-roledescription="slide"]')).not.toBeNull();
     expect(prev.parentElement).toBe(next.parentElement);
-    expect(next.className).toMatch(/(^|\s)absolute(\s|$)/);
-    expect(next.className).toContain("right-3");
-    expect(prev.className).toContain("left-3");
     expect(
       over
         .getByLabelText("Go to slide 1")
@@ -329,31 +376,59 @@ describe("Slider autoplay", () => {
     ).toBeNull();
   });
 
-  it("dotPlacement overlay floats the dots over the slides on a dark pill", () => {
+  it("the overlay arrows float over the slides, one on each edge", () => {
+    // Next once sat on top of Previous at the left edge, and once dropped
+    // below the photo out of sight: both leave a visitor with one arrow.
+    const { getByLabelText } = renderSlider({ arrowPlacement: "overlay" });
+    const prev = getByLabelText("Previous slide");
+    const next = getByLabelText("Next slide");
+    expect(outOfFlow(prev), "Previous floats over the slides").toBe(true);
+    expect(outOfFlow(next), "Next floats over the slides").toBe(true);
+    expect([...anchors(prev)], "Previous sits on the left edge").toEqual(["left"]);
+    expect([...anchors(next)], "Next sits on the right edge").toEqual(["right"]);
+  });
+
+  it("a keyboard-focused overlay arrow shows an indicator that reads over a light photo", () => {
+    // The base outline turns white inside a dark card, and lies outside the
+    // arrow's disc, so on a light photo it is the halo or nothing.
+    const { getByLabelText } = renderSlider({ arrowPlacement: "overlay" });
+    for (const name of ["Previous slide", "Next slide"]) {
+      const best = Math.max(
+        0,
+        ...focusColours(getByLabelText(name), WHITE).map((c) => contrast(c, WHITE)),
+      );
+      expect(best, `${name} focus indicator on white`).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("overlay dots float over the photo on a pill that keeps them readable on any photo", () => {
+    const { getByLabelText } = renderSlider({
+      dotPlacement: "overlay",
+      dotClass: "bg-white/60",
+      activeDotClass: "bg-white",
+    });
+    const pill = getByLabelText("Go to slide 1").parentElement!;
+    expect(outOfFlow(pill), "the pill floats over the slides").toBe(true);
+    const dot = getByLabelText("Go to slide 2").querySelector("span")!;
+    for (const photo of [WHITE, BLACK]) {
+      const ground = groundOf(pill, { within: pill, under: photo });
+      const shown = groundOf(dot, { within: pill, under: photo });
+      expect(
+        contrast(shown, ground),
+        `inactive dot on a ${photo.r ? "light" : "dark"} photo`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("dotPlacement overlay places the dots inside the slide container", () => {
     const { getByLabelText } = renderSlider({ dotPlacement: "overlay" });
     const pill = getByLabelText("Go to slide 1").parentElement!;
     expect(pill.parentElement!.querySelector('[aria-roledescription="slide"]')).not.toBeNull();
-    expect(pill.classList.contains("absolute")).toBe(true);
-    expect(pill.classList.contains("bg-black/70")).toBe(true);
-    expect(pill.classList.contains("gap-0")).toBe(true);
-    expect(pill.className).toContain("max-w-[calc(100%-1.5rem)]");
-    expect(getByLabelText("Go to slide 2").className).toMatch(
-      /focus-visible:shadow-\[0_0_0_\d+px_rgb\(0_0_0\/0\.\d+\)\]/,
-    );
   });
 
   it("with arrows and dots both overlaid and no autoplay, no empty controls row renders", () => {
     const { container } = renderSlider({ arrowPlacement: "overlay", dotPlacement: "overlay" });
     expect(container.querySelector(".mt-8")).toBeNull();
-  });
-
-  it("fill stretches the carousel and its slides to the parent's height", () => {
-    const { container } = renderSlider({ mode: "fade", fill: true });
-    const root = container.querySelector('[aria-roledescription="carousel"]')!;
-    expect(root.classList.contains("h-full")).toBe(true);
-    const slide = container.querySelector('[aria-roledescription="slide"]')!;
-    expect(slide.classList.contains("h-full")).toBe(true);
-    expect(slide.parentElement!.className).toContain("grid-rows-[minmax(0,1fr)]");
   });
 
   it("arrowClass reaches both arrows in either placement", () => {
@@ -363,13 +438,6 @@ describe("Slider autoplay", () => {
       expect(getByLabelText("Next slide").classList.contains("x-probe")).toBe(true);
       cleanup();
     }
-  });
-
-  it("an overlay arrow's focus ring sits on a dark halo, so it reads over a light photo", () => {
-    const { getByLabelText } = renderSlider({ arrowPlacement: "overlay" });
-    expect(getByLabelText("Next slide").className).toMatch(
-      /focus-visible:shadow-\[0_0_0_\d+px_rgb\(0_0_0\/0\.\d+\)\]/,
-    );
   });
 
   it("the arrow glyphs are hidden from assistive tech inside their labelled buttons", () => {

@@ -1,5 +1,10 @@
 /* Tailwind CSS v4 configuration */
 @import "tailwindcss";
+/* Test files, the test-only contrast helper and the docs hold probe classes
+   (some deliberately invalid queries) that must never reach the shipped CSS. */
+@source not "./**/*.test.ts";
+@source not "./test-utils";
+@source not "../docs";
 
 @font-face {
   font-family: "Nunito";

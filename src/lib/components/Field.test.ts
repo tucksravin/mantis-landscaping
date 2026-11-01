@@ -1,6 +1,13 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { render, cleanup } from "@testing-library/svelte";
 import Field from "./Field.svelte";
+import {
+  cascadeWinner,
+  colourOf,
+  contrast,
+  everyColour,
+  groundOf,
+} from "../../test-utils/theme-colors";
 
 afterEach(() => cleanup());
 
@@ -61,10 +68,18 @@ describe("Field", () => {
 
 // The control's skin, which had two defects a class list cannot show you.
 describe("Field styling", () => {
+  // The input and the textarea once carried two copy-pasted class lists, which
+  // is exactly how a fix lands on one control and not the other, so every check
+  // below runs against both.
+  const controls = [
+    { type: "text", label: "A" },
+    { type: "textarea", label: "B" },
+  ] as const;
+
   it("gives the input and the textarea the SAME classes", () => {
-    // They carried two copy-pasted class lists, which is exactly how a fix
-    // lands on one control and not the other — the invisible border below had
-    // to be changed in two places.
+    // Parity, not a value: a fix that lands on one control and not the other
+    // (the textarea losing its focus ring, say) is caught here whatever the
+    // class list happens to be.
     const input = render(Field, { name: "a", label: "A" });
     const inputClass = input.getByLabelText("A").getAttribute("class");
     input.unmount();
@@ -73,28 +88,63 @@ describe("Field styling", () => {
     expect(area.getByLabelText("B").getAttribute("class")).toBe(inputClass);
   });
 
-  it("draws a resting border that clears the 3:1 non-text minimum", () => {
-    // --color-light is #e5e7eb: 1.20:1 against the white card, so the fields
-    // read as invisible boxes and a visitor has to hunt for where to type.
-    // WCAG 1.4.11 wants 3:1 for a control's boundary. --color-secondary
-    // (#6b7280) is 4.83:1.
-    const { getByLabelText } = render(Field, { name: "a", label: "A" });
-    const cls = getByLabelText("A").getAttribute("class") ?? "";
-    expect(cls).not.toContain("border-light");
-    expect(cls).toContain("border-secondary");
-  });
+  it.each(controls)(
+    "every border colour it can take (resting, hover, focus) clears 3:1 on the page ($type)",
+    ({ type, label }) => {
+      // A hover border of --color-light measured 1.09:1 on white: the box
+      // vanished under the pointer. Every state's border is a control boundary.
+      // Read from the compiled stylesheet: Tailwind's own palette, alpha,
+      // arbitrary values and every variant (hover, focus, aria-invalid,
+      // breakpoints) count, and a colour the helper cannot read throws.
+      const { getByLabelText } = render(Field, { name: "a", label, type });
+      const control = getByLabelText(label);
+      const page = groundOf(control.parentElement!);
+      const borders = everyColour(control, "border-color");
+      expect(borders.length, "the control draws a border").toBeGreaterThan(0);
+      for (const border of borders)
+        expect(
+          contrast(border, page),
+          `border rgb(${border.r} ${border.g} ${border.b})`,
+        ).toBeGreaterThanOrEqual(3);
+    },
+  );
 
-  it("keeps the forced-colors outline fallback on focus (Tailwind v4)", () => {
-    // In Tailwind v4 `outline-none` resolves to `outline-style: none` and takes
-    // the forced-colors fallback with it; `outline-hidden` keeps the 2px
-    // transparent outline the forced-colors palette repaints. Under forced
-    // colours the ring is dropped by the engine, so that outline is the only
-    // focus affordance left.
-    const { getByLabelText } = render(Field, { name: "a", label: "A" });
-    const cls = getByLabelText("A").getAttribute("class") ?? "";
-    expect(cls).toContain("focus:outline-hidden");
-    expect(cls).not.toContain("focus:outline-none");
-  });
+  it.each(controls)(
+    "draws a resting border that clears the 3:1 non-text minimum ($type)",
+    ({ type, label }) => {
+      // --color-light (#e5e7eb then) was 1.20:1 against the white card, so the
+      // fields read as invisible boxes and a visitor has to hunt for where to
+      // type. WCAG 1.4.11 wants 3:1 for a control's boundary.
+      const { getByLabelText } = render(Field, { name: "a", label, type });
+      const control = getByLabelText(label);
+      const border = colourOf(control, "border-color");
+      expect(border, "the control draws a border").toBeDefined();
+      expect(contrast(border!, groundOf(control.parentElement!))).toBeGreaterThanOrEqual(3);
+    },
+  );
+
+  it.each(controls)(
+    "keeps the forced-colors outline fallback on focus (Tailwind v4, $type)",
+    ({ type, label }) => {
+      // In Tailwind v4 `outline-none` resolves to `outline-style: none` and takes
+      // the forced-colors fallback with it. Under forced colours the ring is
+      // dropped by the engine, so that outline is the only focus affordance left.
+      // Measured through the cascade, so `focus:outline-none`, `outline-0`
+      // and an arbitrary `focus:[outline:none]` all fail alike.
+      const { getByLabelText } = render(Field, { name: "a", label, type });
+      const control = getByLabelText(label);
+      for (const state of [
+        { focus: true, forcedColors: true },
+        { focusVisible: true, forcedColors: true },
+      ]) {
+        const style = cascadeWinner(control, ["outline", "outline-style"], state);
+        const width = cascadeWinner(control, ["outline", "outline-width"], state);
+        expect(style, "an outline is set under forced colours").toBeDefined();
+        expect(style!.value, "outline style").not.toMatch(/(^|\s)(none|hidden)(\s|$)/);
+        expect(width!.value, "outline width").not.toMatch(/(^|\s)0(px)?(\s|$)/);
+      }
+    },
+  );
 });
 
 // Modal.svelte finds its initial-focus target by `[autofocus]`; with none, the

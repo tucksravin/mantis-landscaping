@@ -1,6 +1,8 @@
 import { describe, expect, it, afterEach } from "vitest";
 import { render, cleanup } from "@testing-library/svelte";
 import CtaBanner from "./index.svelte";
+import model from "./model.json";
+import { colourOf, contrast, groundOf, textColour } from "../../../test-utils/theme-colors";
 
 afterEach(() => cleanup());
 
@@ -39,16 +41,44 @@ describe("CtaBanner slice", () => {
     expect(container.querySelector('[data-slice-type="cta_banner"]')).not.toBeNull();
   });
 
-  it("paints the selected ground and inverts the button on the dark one", () => {
-    const { container } = render(CtaBanner, {
-      props: { slice: makeSlice({ background: "dark" }) },
-    });
-    const section = container.querySelector("section");
-    expect(section?.className).toContain("bg-dark");
-    expect(section?.className).toContain("text-white");
-    const cta = container.querySelector("a");
-    expect(cta?.className).toContain("border-white");
-    expect(cta?.className).not.toContain("border-dark");
+  const backgrounds = (
+    model as unknown as {
+      variations: { primary: { background: { config: { options: string[] } } } }[];
+    }
+  ).variations[0].primary.background.config.options;
+
+  it("honours the editor's dark ground: it differs from the light one", () => {
+    const ground = (background: string) => {
+      const { container, unmount } = render(CtaBanner, {
+        props: { slice: makeSlice({ background }) },
+      });
+      const g = groundOf(container.querySelector("h2")!);
+      unmount();
+      return g;
+    };
+    expect(ground("dark")).not.toEqual(ground("light"));
+  });
+
+  // Measured on every ground the editor can pick, at rest, under the pointer,
+  // under keyboard focus and once followed: the headline at 4.5:1, the CTA's label at 4.5:1 on its own fill,
+  // and its outline at 3:1 against the band (WCAG 1.4.11). A "dark" band that
+  // paints white leaves the inverse button white on white, and this fails.
+  it.each(backgrounds)("the headline and the CTA read on the %s ground", (background) => {
+    const { container } = render(CtaBanner, { props: { slice: makeSlice({ background }) } });
+    const h2 = container.querySelector("h2")!;
+    expect(contrast(textColour(h2), groundOf(h2)), "headline").toBeGreaterThanOrEqual(4.5);
+    const cta = container.querySelector("a")!;
+    const band = groundOf(cta.parentElement!);
+    for (const state of [{}, { hover: true }, { focusVisible: true }, { visited: true }]) {
+      const label = contrast(textColour(cta, state), groundOf(cta, { state }));
+      expect(label, `CTA label ${JSON.stringify(state)}`).toBeGreaterThanOrEqual(4.5);
+      const border = colourOf(cta, "border-color", state);
+      expect(border, "the CTA draws an outline").toBeDefined();
+      expect(
+        contrast(border!, band),
+        `CTA outline ${JSON.stringify(state)}`,
+      ).toBeGreaterThanOrEqual(3);
+    }
   });
 
   it("omits the CTA when the link or the label is missing", () => {

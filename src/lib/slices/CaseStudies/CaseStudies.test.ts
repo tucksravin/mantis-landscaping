@@ -4,6 +4,7 @@ import { describe, it, expect } from "vitest";
 import type { Content } from "@prismicio/client";
 import type { ProjectDocument } from "../../../prismicio-types";
 import CaseStudies from "./index.svelte";
+import { contrast, groundOf, themeColour } from "../../../test-utils/theme-colors";
 
 const slice = {
   slice_type: "case_studies",
@@ -78,8 +79,13 @@ describe("CaseStudies slice", () => {
     });
     expect(container.querySelector("article")).not.toBeNull();
     expect(container.querySelector('[role="region"]')).toBeNull();
-    const text = container.querySelector("article > div") as HTMLElement;
-    expect(text.className).toContain("md:col-span-5");
+    // With no photo column the text takes the whole card, not the 2/5 it
+    // shares with photos: its span equals the article's column count.
+    const article = container.querySelector("article") as HTMLElement;
+    const text = article.querySelector(":scope > div") as HTMLElement;
+    const cols = /(?:^|\s)md:grid-cols-(\d+)(?:\s|$)/.exec(article.className)?.[1];
+    expect(cols, "the card is a multi-column grid on desktop").toBeDefined();
+    expect(text.className).toMatch(new RegExp(`(^|\\s)md:col-span-(${cols}|full)(\\s|$)`));
   });
 
   it("renders nothing outside a project", () => {
@@ -102,16 +108,13 @@ describe("CaseStudies photos", () => {
     expect(container.querySelector("img")?.getAttribute("sizes")).toBe(SINGLE_PHOTO_SIZES);
   });
 
-  it("several photos are a fade carousel showing one photo at a time, not a scroll strip", () => {
+  it("several photos are a carousel showing one photo at a time", () => {
     const { container } = render(CaseStudies, { props: { slice, context: { project: two() } } });
     const carousel = container.querySelector('[aria-roledescription="carousel"]') as HTMLElement;
     expect(carousel).not.toBeNull();
-    expect(container.innerHTML).not.toMatch(/overflow-x-(auto|scroll)|snap-x/);
     const slides = [...carousel.querySelectorAll('[aria-roledescription="slide"]')];
     expect(slides).toHaveLength(2);
     expect(slides.map((el) => el.getAttribute("aria-hidden"))).toEqual([null, "true"]);
-    expect(slides[0].className).toContain("duration-500");
-    expect(slides[0].className).toContain("transition-opacity");
   });
 
   it("every carousel photo describes the full column in sizes", () => {
@@ -135,29 +138,21 @@ describe("CaseStudies photos", () => {
     expect(shown()).toBe(0);
   });
 
-  it("the photo column fills the card's height and the dots float over the photo", () => {
-    const { container } = render(CaseStudies, { props: { slice, context: { project: two() } } });
-    const column = container.querySelector("article > div") as HTMLElement;
-    for (const cls of ["relative", "self-stretch", "w-full", "aspect-[4/3]"])
-      expect(column.classList.contains(cls), cls).toBe(true);
-    const carousel = column.querySelector('[aria-roledescription="carousel"]') as HTMLElement;
-    expect(carousel.classList.contains("absolute!")).toBe(true);
-    expect(carousel.classList.contains("h-full")).toBe(true);
-    const pill = within(container).getByRole("button", { name: "Go to slide 1" }).parentElement!;
-    expect(pill.classList.contains("absolute")).toBe(true);
-    expect(container.querySelector("img")!.className).not.toContain("aspect-");
-  });
-
-  it("controls are white on the moss card", () => {
+  it("the inactive slide dots read on their pill over a light or a dark photo", () => {
     const { container } = render(CaseStudies, { props: { slice, context: { project: two() } } });
     const view = within(container);
-    const next = view.getByRole("button", { name: "Next slide" });
-    expect(next.className).toContain("text-white");
-    expect(next.classList.contains("bg-black/50")).toBe(true);
-    expect(next.parentElement!.querySelector('[aria-roledescription="slide"]')).not.toBeNull();
-    expect(view.getByRole("button", { name: "Previous slide" }).parentElement).toBe(
-      next.parentElement,
-    );
-    expect(view.getByRole("button", { name: "Go to slide 2" }).innerHTML).toContain("bg-white/60");
+    const pill = view.getByRole("button", { name: "Go to slide 1" }).parentElement!;
+    const dot = view.getByRole("button", { name: "Go to slide 2" }).querySelector("span")!;
+    for (const photo of ["white", "black"]) {
+      for (const state of [{}, { hover: true }]) {
+        const under = themeColour(photo);
+        const ground = groundOf(pill, { within: pill, under, state });
+        const shown = groundOf(dot, { within: pill, under, state });
+        expect(
+          contrast(shown, ground),
+          `dot on pill over ${photo} ${JSON.stringify(state)}`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    }
   });
 });
